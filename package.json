@@ -1,0 +1,56 @@
+{
+  "name": "dsh-plugin-fallback-continue",
+  "version": "1.1.0",
+  "description": "DSH (DeepSeek Harness) plugin: when a conversation turn fails, auto-send \"continue\" once and stop, escalating the retry interval on each consecutive failure and resetting on any success — unattended progress toward the goal.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "fallback",
+    "continue",
+    "retry",
+    "unattended"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akwangho/dsh-fallback-continue.git"
+  },
+  "homepage": "https://github.com/akwangho/dsh-fallback-continue#readme",
+  "bugs": {
+    "url": "https://github.com/akwangho/dsh-fallback-continue/issues"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
+    "react": "^18.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

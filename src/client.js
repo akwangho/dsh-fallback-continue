@@ -36,7 +36,7 @@ return {
       }
     }
 
-    // ---- bottom-right floating countdown (current session only) ----
+    // ---- bottom-right floating status (current session only) ----
     slots.inject('shell.overlay', () => slots.register(
       { name: 'shell.overlay', id: 'fallback-continue-pill', order: 500 },
       (props) => React.createElement(Pill, { useSessions: props.useSessions }),
@@ -75,16 +75,25 @@ return {
       const entry = state.sessions && state.sessions.find((e) => e.sessionId === currentId)
       if (!entry) return null
 
+      const cancel = () => host.call('cancel', { sessionId: currentId }).catch(() => {})
+
+      if (entry.phase === 'awaiting') {
+        // Sent already — no countdown, just a muted status we can dismiss.
+        return h('div', { className: 'fbc-pill fbc-pill-muted' },
+          h('span', { className: 'fbc-pill-text' }, '已送出「' + (entry.text || '繼續') + '」，等待結果'),
+          h('span', { className: 'fbc-pill-x', title: '取消', onClick: cancel }, '✕'),
+        )
+      }
+
       const text = entry.text || '繼續'
       const label = entry.paused
         ? '⏸ ' + fmtClock(entry.remainingMs) + ' 已暫停'
-        : '⏳ ' + fmtClock(entry.remainingMs) + ' 後自動繼續「' + text + '」(#' + (entry.attempts + 1) + ')'
+        : '⏳ ' + fmtClock(entry.remainingMs) + ' 後自動繼續「' + text + '」(#' + (entry.failures + 1) + ')'
 
       const toggle = () => {
         if (entry.paused) host.call('resume', { sessionId: currentId }).catch(() => {})
         else host.call('pause', { sessionId: currentId }).catch(() => {})
       }
-      const cancel = () => host.call('cancel', { sessionId: currentId }).catch(() => {})
 
       return h('div', { className: 'fbc-pill' },
         h('span', { className: 'fbc-pill-text', title: '點擊暫停／繼續', onClick: toggle }, label),
@@ -148,54 +157,30 @@ return {
 
       return h('div', { className: 'fbc-settings' },
         h('h3', null, '失敗自動繼續'),
-
         h('label', { className: 'fbc-row fbc-toggle' },
-          h('input', {
-            type: 'checkbox',
-            checked: !!draft.enabled,
-            onChange: (ev) => save({ enabled: ev.target.checked }),
-          }),
+          h('input', { type: 'checkbox', checked: !!draft.enabled, onChange: (ev) => save({ enabled: ev.target.checked }) }),
           h('span', null, '啟用'),
         ),
-
         h('div', { className: 'fbc-field' },
           h('label', { className: 'fbc-label' }, '自動送出的文字'),
-          h('input', {
-            className: 'fbc-input', type: 'text', value: draft.continueText,
-            onChange: (ev) => setDraft({ ...draft, continueText: ev.target.value }),
-          }),
+          h('input', { className: 'fbc-input', type: 'text', value: draft.continueText, onChange: (ev) => setDraft({ ...draft, continueText: ev.target.value }) }),
           h('button', { className: 'fbc-btn', onClick: () => save({ continueText: draft.continueText }) }, '儲存'),
         ),
-
         h('div', { className: 'fbc-field' },
           h('label', { className: 'fbc-label' }, '重試間隔（分鐘，逗號分隔）'),
-          h('input', {
-            className: 'fbc-input', type: 'text', value: draft.intervalsText,
-            onChange: (ev) => setDraft({ ...draft, intervalsText: ev.target.value }),
-          }),
+          h('input', { className: 'fbc-input', type: 'text', value: draft.intervalsText, onChange: (ev) => setDraft({ ...draft, intervalsText: ev.target.value }) }),
           h('button', { className: 'fbc-btn', onClick: () => save({ retryIntervals: draft.intervalsText }) }, '儲存'),
         ),
-
         h('label', { className: 'fbc-row fbc-toggle' },
-          h('input', {
-            type: 'checkbox',
-            checked: !!draft.capEnabled,
-            onChange: (ev) => save({ capEnabled: ev.target.checked }),
-          }),
+          h('input', { type: 'checkbox', checked: !!draft.capEnabled, onChange: (ev) => save({ capEnabled: ev.target.checked }) }),
           h('span', null, '超過上限自動停止'),
         ),
-
         h('div', { className: 'fbc-field' },
           h('label', { className: 'fbc-label' }, '上限時數（0＝無上限）'),
-          h('input', {
-            className: 'fbc-input', type: 'number', min: 0, value: String(draft.capHours),
-            onChange: (ev) => setDraft({ ...draft, capHours: ev.target.value }),
-          }),
+          h('input', { className: 'fbc-input', type: 'number', min: 0, value: String(draft.capHours), onChange: (ev) => setDraft({ ...draft, capHours: ev.target.value }) }),
           h('button', { className: 'fbc-btn', onClick: () => save({ capHours: num(draft.capHours) }) }, '儲存'),
         ),
-
         waitList(state, h),
-
         msg ? h('p', { className: 'fbc-msg' }, msg) : null,
         h('div', { className: 'fbc-footer' }, '版本 ' + state.version),
       )
@@ -207,24 +192,32 @@ return {
         return h('p', { className: 'fbc-muted' }, '目前沒有等待中的會話。')
       }
       return h('div', { className: 'fbc-list' },
-        rows.map((e) => h('div', { key: e.sessionId, className: 'fbc-list-row' },
-          h('div', { className: 'fbc-list-main' },
-            h('div', { className: 'fbc-list-title' }, shortId(e.sessionId)),
-            h('div', { className: 'fbc-list-sub' },
-              '#' + (e.attempts + 1) + ' · ' + (e.paused ? '已暫停' : fmtClock(e.remainingMs)) +
-              ' · ' + (e.reason || 'error')),
-          ),
-          h('div', { className: 'fbc-list-actions' },
-            h('button', {
-              className: 'fbc-btn',
-              onClick: () => (e.paused
-                ? host.call('resume', { sessionId: e.sessionId })
-                : host.call('pause', { sessionId: e.sessionId })),
-            }, e.paused ? '繼續' : '暫停'),
-            h('button', { className: 'fbc-btn', onClick: () => host.call('retryNow', { sessionId: e.sessionId }) }, '立即重試'),
-            h('button', { className: 'fbc-btn fbc-btn-danger', onClick: () => host.call('cancel', { sessionId: e.sessionId }) }, '取消'),
-          ),
-        )),
+        rows.map((e) => {
+          const phaseText = e.phase === 'awaiting'
+            ? '已送出，等待結果'
+            : (e.paused ? '已暫停' : fmtClock(e.remainingMs))
+          return h('div', { key: e.sessionId, className: 'fbc-list-row' },
+            h('div', { className: 'fbc-list-main' },
+              h('div', { className: 'fbc-list-title' }, shortId(e.sessionId)),
+              h('div', { className: 'fbc-list-sub' },
+                '#' + (e.failures + 1) + ' · ' + phaseText + ' · ' + (e.reason || 'error')),
+            ),
+            h('div', { className: 'fbc-list-actions' },
+              e.phase === 'counting'
+                ? h('button', {
+                    className: 'fbc-btn',
+                    onClick: () => (e.paused
+                      ? host.call('resume', { sessionId: e.sessionId })
+                      : host.call('pause', { sessionId: e.sessionId })),
+                  }, e.paused ? '繼續' : '暫停')
+                : null,
+              e.phase === 'counting'
+                ? h('button', { className: 'fbc-btn', onClick: () => host.call('retryNow', { sessionId: e.sessionId }) }, '立即重試')
+                : null,
+              h('button', { className: 'fbc-btn fbc-btn-danger', onClick: () => host.call('cancel', { sessionId: e.sessionId }) }, '取消'),
+            ),
+          )
+        }),
       )
     }
 
@@ -238,7 +231,9 @@ return {
         box-shadow: 0 4px 16px rgba(0,0,0,0.4); pointer-events: auto;
         font-family: system-ui, -apple-system, sans-serif;
       }
+      .fbc-pill-muted { opacity: 0.8; }
       .fbc-pill-text { cursor: pointer; user-select: none; }
+      .fbc-pill-muted .fbc-pill-text { cursor: default; }
       .fbc-pill-x { cursor: pointer; opacity: 0.7; padding-left: 2px; }
       .fbc-pill-x:hover { opacity: 1; }
       .fbc-settings { display: flex; flex-direction: column; gap: 12px; padding: 4px 0; font-size: 13px; }
@@ -247,16 +242,12 @@ return {
       .fbc-toggle input { cursor: pointer; }
       .fbc-field { display: flex; flex-direction: column; gap: 4px; }
       .fbc-label { font-size: 11px; opacity: 0.7; }
-      .fbc-input { padding: 6px 8px; border: 1px solid rgba(255,255,255,0.12);
-        border-radius: 6px; background: rgba(255,255,255,0.04); color: inherit; font-size: 13px; }
-      .fbc-btn { padding: 4px 10px; border: 1px solid rgba(255,255,255,0.14);
-        border-radius: 6px; background: rgba(255,255,255,0.06); color: inherit;
-        cursor: pointer; font-size: 12px; }
+      .fbc-input { padding: 6px 8px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; background: rgba(255,255,255,0.04); color: inherit; font-size: 13px; }
+      .fbc-btn { padding: 4px 10px; border: 1px solid rgba(255,255,255,0.14); border-radius: 6px; background: rgba(255,255,255,0.06); color: inherit; cursor: pointer; font-size: 12px; }
       .fbc-btn:hover { background: rgba(255,255,255,0.12); }
       .fbc-btn-danger:hover { border-color: rgba(255,90,90,0.6); color: #ff9a9a; }
       .fbc-list { display: flex; flex-direction: column; gap: 8px; }
-      .fbc-list-row { display: flex; align-items: center; justify-content: space-between;
-        gap: 8px; padding: 8px; border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; }
+      .fbc-list-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px; border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; }
       .fbc-list-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
       .fbc-list-title { font-weight: 600; }
       .fbc-list-sub { font-size: 11px; opacity: 0.7; }

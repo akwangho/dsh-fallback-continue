@@ -1,8 +1,17 @@
 // dsh-fallback-continue — Host half (dynamic Cordis package body).
 // Must be a plain-JS function body that RETURNS a Cordis Plugin object.
 // No import/require/TS/JSX. Timers via the `timer` service (ctx.get('timer')).
+//
+// Behavior model (unattended "keep working toward the goal"):
+//   - A turn ending in `error` (= red "本輪運行失敗") starts/continues a streak.
+//   - A countdown arms; when it expires it sends the configured "繼續" text and
+//     then STOPS timing (no re-arm) — it waits for the model's next outcome.
+//   - If the next turn errors again, the streak escalates (next interval in the
+//     list) and arms a new countdown.
+//   - If a turn completes (or max-tokens, i.e. the model produced output), the
+//     streak resets to the beginning (entry removed).
 
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 
 const DEFAULTS = {
   enabled: false,
@@ -21,7 +30,6 @@ return {
     if (agents === undefined) return
     if (timer === undefined) return
 
-    // --- runtime config (volatile, in-memory) ---
     let config = {
       enabled: DEFAULTS.enabled,
       continueText: DEFAULTS.continueText,
@@ -30,16 +38,17 @@ return {
       capHours: DEFAULTS.capHours,
     }
 
-    // entry = { sessionId, attempts, reason, text, paused, pausedRemainingMs,
-    //           startedAt, failedAt, remainingMs, timerDisposer }
+    // entry = { sessionId, failures, reason, text, paused, pausedRemainingMs,
+    //           startedAt, failedAt, remainingMs, timerDisposer, phase, stopped, stopReason }
+    //   phase: 'counting' (timer armed) | 'awaiting' (sent, no timer, waiting for outcome)
     const sessions = new Map()
 
     const now = () => Date.now()
 
-    function intervalFor(attemptIndex) {
+    function intervalFor(failureIndex) {
       const list = config.retryIntervalsMinutes
       if (!list || list.length === 0) return 60000
-      const idx = Math.min(attemptIndex, list.length - 1)
+      const idx = Math.min(failureIndex, list.length - 1)
       let mins = Number(list[idx])
       if (!Number.isFinite(mins) || mins <= 0) mins = 60
       return Math.round(mins * 60000)
@@ -53,6 +62,7 @@ return {
     }
 
     function remaining(entry) {
+      if (entry.phase === 'awaiting') return null
       if (entry.paused) return entry.pausedRemainingMs != null ? entry.pausedRemainingMs : entry.remainingMs
       if (entry.startedAt == null) return entry.remainingMs
       const rem = entry.remainingMs - (now() - entry.startedAt)
@@ -71,8 +81,9 @@ return {
     function arm(entry) {
       if (!config.enabled) { entry.timerDisposer = null; return }
       if (entry.paused) { entry.timerDisposer = null; return }
+      if (entry.phase !== 'counting') return
       if (overCap(entry)) { stopEntry(entry.sessionId, 'cap'); return }
-      const delay = entry.remainingMs != null ? entry.remainingMs : intervalFor(entry.attempts)
+      const delay = entry.remainingMs != null ? entry.remainingMs : intervalFor(entry.failures)
       entry.remainingMs = delay
       entry.startedAt = now()
       if (entry.timerDisposer) { try { entry.timerDisposer() } catch (_) {} }
@@ -82,6 +93,7 @@ return {
     function fire(entry) {
       if (entry.stopped || !sessions.has(entry.sessionId)) return
       if (entry.paused) return
+      if (entry.phase !== 'counting') return
       if (overCap(entry)) { stopEntry(entry.sessionId, 'cap'); return }
       const agent = agents.get(entry.sessionId)
       if (agent === undefined || typeof agent.followup !== 'function') {
@@ -96,10 +108,11 @@ return {
         stopEntry(entry.sessionId, 'send-failed')
         return
       }
-      entry.attempts += 1
-      entry.remainingMs = intervalFor(entry.attempts)
+      // Sent: stop timing. Wait for the next failure (escalate) or success (reset).
+      if (entry.timerDisposer) { try { entry.timerDisposer() } catch (_) {} entry.timerDisposer = null }
+      entry.phase = 'awaiting'
       entry.startedAt = null
-      arm(entry)
+      entry.remainingMs = null
     }
 
     function makeUserMessage(text) {
@@ -112,17 +125,26 @@ return {
       }
     }
 
-    function startCountdown(sessionId, reason, text) {
+    // Failure streaks: every new failure escalates; a fresh streak starts at 0.
+    function onFailure(sessionId, reason, text) {
       const id = String(sessionId)
-      const existing = sessions.get(id)
-      if (existing) {
-        existing.reason = reason || existing.reason
-        if (text) existing.text = text
+      let entry = sessions.get(id)
+      if (entry) {
+        entry.failures += 1
+        entry.reason = reason || entry.reason
+        if (text) entry.text = text
+        entry.paused = false
+        entry.pausedRemainingMs = null
+        entry.phase = 'counting'
+        entry.remainingMs = intervalFor(entry.failures)
+        entry.startedAt = null
+        if (entry.timerDisposer) { try { entry.timerDisposer() } catch (_) {} entry.timerDisposer = null }
+        arm(entry)
         return
       }
-      const entry = {
+      entry = {
         sessionId: id,
-        attempts: 0,
+        failures: 0,
         reason: reason || 'error',
         text: text || config.continueText,
         paused: false,
@@ -133,22 +155,14 @@ return {
         timerDisposer: null,
         stopped: false,
         stopReason: null,
+        phase: 'counting',
       }
       entry.remainingMs = intervalFor(0)
       sessions.set(id, entry)
       arm(entry)
     }
 
-    // ---- failure detection ----
-    const offErr = ctx.on('agent/error', (payload) => {
-      if (!config.enabled) return
-      const agent = payload && payload.agent
-      const id = agent && agent.id
-      if (!id) return
-      startCountdown(id, 'error', config.continueText)
-    })
-
-    // turn/end with error or max-tokens
+    // ---- failure / success detection (turn/end is the canonical signal) ----
     const offTurnEnd = ctx.on('session/event', (session, event) => {
       if (!config.enabled) return
       if (!event || event.type !== 'turn/end') return
@@ -156,9 +170,12 @@ return {
       if (!reason) return
       const id = session && session.id
       if (!id) return
-      if (reason.kind === 'error') startCountdown(id, 'error', config.continueText)
-      else if (reason.kind === 'max-tokens') startCountdown(id, 'max-tokens', config.continueText)
-      else if (reason.kind === 'completed') stopEntry(String(id), 'completed')
+      if (reason.kind === 'error') {
+        onFailure(id, 'error', config.continueText)
+      } else if (reason.kind === 'completed' || reason.kind === 'max-tokens') {
+        // Model produced output (or the turn finished normally): reset the streak.
+        stopEntry(String(id), 'completed')
+      }
     })
 
     // human take-over: durable user/message authored by a human
@@ -183,7 +200,6 @@ return {
       stopEntry(String(sessionId), 'removed')
     })
 
-    // Own the in-flight timers: cleared when the plugin stops.
     ctx.effect(() => () => {
       for (const id of Array.from(sessions.keys())) stopEntry(id, 'unload')
     })
@@ -192,10 +208,11 @@ return {
     function publicEntry(e) {
       return {
         sessionId: e.sessionId,
-        attempts: e.attempts,
+        failures: e.failures,
         reason: e.reason,
         text: e.text,
         paused: !!e.paused,
+        phase: e.phase,
         remainingMs: remaining(e),
         failedAt: e.failedAt,
       }
@@ -232,7 +249,7 @@ return {
         for (const id of Array.from(sessions.keys())) stopEntry(id, 'disabled')
       } else {
         for (const e of sessions.values()) {
-          if (!e.paused) arm(e)
+          if (!e.paused && e.phase === 'counting') arm(e)
         }
       }
       return { ok: true, config: {
@@ -249,6 +266,7 @@ return {
       const e = sessions.get(id)
       if (!e) return { ok: false, error: 'no-such-session' }
       if (e.paused) return { ok: true }
+      if (e.phase !== 'counting') return { ok: true }
       if (e.timerDisposer) { try { e.timerDisposer() } catch (_) {} e.timerDisposer = null }
       e.pausedRemainingMs = remaining(e)
       e.paused = true
@@ -261,9 +279,10 @@ return {
       if (!e) return { ok: false, error: 'no-such-session' }
       if (!e.paused) return { ok: true }
       e.paused = false
-      e.remainingMs = e.pausedRemainingMs != null ? e.pausedRemainingMs : intervalFor(e.attempts)
+      e.remainingMs = e.pausedRemainingMs != null ? e.pausedRemainingMs : intervalFor(e.failures)
       e.pausedRemainingMs = null
       e.startedAt = null
+      e.phase = 'counting'
       arm(e)
       return { ok: true }
     })
@@ -272,6 +291,7 @@ return {
       const id = String((args || {}).sessionId)
       const e = sessions.get(id)
       if (!e) return { ok: true }
+      if (e.phase !== 'counting') return { ok: true }
       if (e.timerDisposer) { try { e.timerDisposer() } catch (_) {} e.timerDisposer = null }
       e.paused = false
       e.pausedRemainingMs = null
