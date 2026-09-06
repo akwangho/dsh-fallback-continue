@@ -54,14 +54,15 @@ dsh plugin --profile web add github:akwangho/dsh-fallback-continue
 
 ## 檔案結構
 
-- `package.json` — npm package（含 `dsh.client` metadata）。
-- `lib/index.js` — Host 半部（失敗偵測、遞增間隔、送「繼續」、停止條件、Typert `fallbackContinue` Remote 服務）。
+- `package.json` — npm package（含 `dsh.client` metadata）與唯一版本號來源。
+- `lib/index.js` — Host 半部（失敗偵測、遞增間隔、優先插隊送「繼續」、停止條件、Typert `fallbackContinue` Remote 服務）。
+- `lib/pure.js` — 純函式（intervalFor/normalizeConfig/DEFAULTS），無相依、可直接單元測試。
 - `lib/client.js` — Client 半部（右下角倒數、設定卡、等待清單）。
-- `src/host.js` / `src/client.js` — 等價的「動態 Cordis」版（給 session 內 `cordis_define` 用，僅供參考）。
-- `config.json` — 名稱、版本與預設值。
+- `test/host.test.mjs` — 純函式的單元測試（`npm test`）。
 
 ## 注意事項
 
 - 重啟 DSH 程序後，等待中的倒數會重來（狀態只在記憶體，不跨程序留存）。
+- 「繼續」以 steering（插隊）方式送出：對閒置中的 agent 會直接開始新 turn、優先於其他排隊訊息，用來先完成尚未完成的任務。
 - 有些失敗是確定性的（例如模型不支援那麼大的 token 數），重試永遠不會成功——這種請手動處理（換模型或調參數），不要等自動繼續。
 - 更新程式後需重啟 `dsh web` 才會生效。
