@@ -11,7 +11,7 @@ import * as pure from '../lib/pure.js'
 // ---------------------------------------------------------------- module shape
 
 test('pure module exposes every exported helper', () => {
-  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText']) {
+  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime']) {
     assert.equal(typeof pure[k], 'function', `missing ${k}`)
   }
   assert.equal(typeof pure.DEFAULTS, 'object')
@@ -254,4 +254,19 @@ test('rateLimitedText explains why the loop did not fire', () => {
   assert.match(s, /429/)
   assert.match(s, /自動繼續未觸發/)
   assert.match(s, /不再自動送出/)
+})
+
+test('rateLimitedText embeds the stop time so the user knows when 429 halted', () => {
+  const at = new Date(2026, 8, 10, 15, 4, 5).getTime() // local 2026-09-10 15:04:05
+  const s = pure.rateLimitedText(at)
+  assert.match(s, /發生時間：2026-09-10 15:04:05/)
+  // default (no arg) still embeds a time in the same shape
+  assert.match(pure.rateLimitedText(), /發生時間：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
+})
+
+test('formatStopTime renders local YYYY-MM-DD HH:mm:ss and tolerates bad input', () => {
+  const at = new Date(2026, 0, 2, 3, 4, 5).getTime()
+  assert.equal(pure.formatStopTime(at), '2026-01-02 03:04:05')
+  assert.match(pure.formatStopTime(NaN), /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
+  assert.match(pure.formatStopTime(undefined), /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
 })
