@@ -249,19 +249,34 @@ test('isRateLimited is false for non-429 / null errors', () => {
 
 // ---------------------------------------------------------------- rateLimitedText
 
-test('rateLimitedText explains why the loop did not fire', () => {
+test('rateLimitedText explains cooldown mode (not a stop)', () => {
   const s = pure.rateLimitedText()
   assert.match(s, /429/)
-  assert.match(s, /自動繼續未觸發/)
-  assert.match(s, /不再自動送出/)
+  assert.match(s, /限流冷卻中/)
+  assert.match(s, /自動送出/)
+  assert.match(s, /回復正常後自動切回原設定的重試間隔/)
 })
 
-test('rateLimitedText embeds the stop time so the user knows when 429 halted', () => {
+test('rateLimitedText embeds the 429 time and the next-attempt time', () => {
   const at = new Date(2026, 8, 10, 15, 4, 5).getTime() // local 2026-09-10 15:04:05
-  const s = pure.rateLimitedText(at)
-  assert.match(s, /發生時間：2026-09-10 15:04:05/)
-  // default (no arg) still embeds a time in the same shape
-  assert.match(pure.rateLimitedText(), /發生時間：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
+  const s = pure.rateLimitedText(at, 720, '繼續')
+  assert.match(s, /發生於 2026-09-10 15:04:05/)
+  // 720 minutes later = 12 hours -> next day 03:04:05
+  assert.match(s, /預計下次送出時間：2026-09-11 03:04:05/)
+})
+
+test('rateLimitedText uses the default 720 when cooldownMinutes is invalid', () => {
+  const at = new Date(2026, 8, 10, 15, 4, 5).getTime()
+  const s = pure.rateLimitedText(at, 0)
+  assert.match(s, /每 720 分鐘/)
+  assert.match(s, /預計下次送出時間：2026-09-11 03:04:05/)
+})
+
+test('rateLimitedText honours a custom cooldown interval', () => {
+  const at = new Date(2026, 0, 1, 0, 0, 0).getTime()
+  const s = pure.rateLimitedText(at, 60, '繼續')
+  assert.match(s, /每 60 分鐘/)
+  assert.match(s, /預計下次送出時間：2026-01-01 01:00:00/)
 })
 
 test('formatStopTime renders local YYYY-MM-DD HH:mm:ss and tolerates bad input', () => {
@@ -269,4 +284,14 @@ test('formatStopTime renders local YYYY-MM-DD HH:mm:ss and tolerates bad input',
   assert.equal(pure.formatStopTime(at), '2026-01-02 03:04:05')
   assert.match(pure.formatStopTime(NaN), /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
   assert.match(pure.formatStopTime(undefined), /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
+})
+
+// ---------------------------------------------------------------- cooldown config
+
+test('normalizeConfig defaults and validates cooldownMinutes', () => {
+  assert.equal(pure.normalizeConfig({}).cooldownMinutes, 720)
+  assert.equal(pure.normalizeConfig({ cooldownMinutes: 60 }).cooldownMinutes, 60)
+  assert.equal(pure.normalizeConfig({ cooldownMinutes: 0 }).cooldownMinutes, 720) // 0 invalid -> default
+  assert.equal(pure.normalizeConfig({ cooldownMinutes: -1 }).cooldownMinutes, 720)
+  assert.equal(pure.normalizeConfig({ cooldownMinutes: 'x' }).cooldownMinutes, 720)
 })
