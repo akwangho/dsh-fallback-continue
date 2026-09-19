@@ -1,13 +1,18 @@
 // dsh-plugin-fallback-continue — controller unit tests (node:test).
 //
 // Covers the queued-prompt holding behavior:
-//   - prompts landing in the inbox while the streak is active are stashed,
-//     never claimed ahead of 「繼續」;
+//   - prompts already queued when the streak arms (or source-less ones
+//     landing later) are stashed, never claimed ahead of 「繼續」;
+//   - a message TYPED by the user during the streak is an explicit takeover:
+//     the streak stops, held prompts are released, and the typed message
+//     runs — it is never swallowed silently;
 //   - 「繼續」 is steered with the queue empty, and nothing is released early;
 //   - held prompts return FIFO only after a real completed turn (and never
 //     after a content-less completed boundary);
-//   - any other exit (cancel, user takeover, disable, ...) still releases them
-//     so user input is never lost, while archive keeps them dropped.
+//   - a blocked turn re-arms the streak (no wedge) and an aborted turn stops
+//     the loop;
+//   - any other exit (cancel, user takeover, disable, ...) still releases
+//     them so user input is never lost, while archive keeps them dropped.
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -23,6 +28,17 @@ function makeMsg(text, kind = 'user') {
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind, plugin: kind === 'user' ? undefined : 'some-plugin' },
+  }
+}
+
+// A message with no `source` at all (untyped/programmatic origin): the only
+// kind the insert-time hold still stashes, since a typed user message is now
+// treated as an explicit takeover.
+function makeNoSourceMsg(text) {
+  return {
+    id: 'm0-' + text + '-' + Math.floor(Math.random() * 1e9).toString(36),
+    role: 'user',
+    content: [{ type: 'text', text }],
   }
 }
 
@@ -98,19 +114,44 @@ test('boundaryHasContent: real work counts as content, empty boundary does not',
 
 // ---------------------------------------------------------------- holding
 
-test('a prompt inserted while counting is held, not left in the inbox', async () => {
+test('a message typed while counting takes over: streak stops, message runs', async () => {
   const ctx = makeCtrl()
   const agent = makeAgent('s1')
   ctx.agentMap.set('s1', agent)
 
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error')) // arm streak
-  const q = makeMsg('fix the tests')
-  ctx.emit('agent/inbox/inserted', { agent, message: q })
+  // An untyped message arrived first and is held (kept out of the inbox).
+  const old = makeNoSourceMsg('old queued')
+  ctx.emit('agent/inbox/inserted', { agent, message: old })
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 1)
 
-  assert.deepEqual(agent.inbox.nextTurn, [], 'prompt must be removed from the inbox')
+  // The prompt RPC inserts the typed message into the inbox BEFORE the
+  // inserted event fires — model it exactly like the real harness.
+  const typed = makeMsg('I will take it from here')
+  agent.inbox.nextTurn.push(typed)
+  ctx.emit('agent/inbox/inserted', { agent, message: typed })
+
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'user takeover stops the streak')
+  // The typed message stays claimable (runs first), and the previously held
+  // prompt is re-queued behind it — never swallowed, never lost.
+  assert.deepEqual(agent.inbox.nextTurn, [typed, old])
+  assert.deepEqual(agent.followed, [old], 'held prompts are released on takeover')
   assert.equal(agent.steered.length, 0)
-  const st = ctx.ctrl.getState()
-  assert.equal(st.sessions[0].heldCount, 1)
+})
+
+test('a message typed while paused also takes over (pause = manual mode)', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1')
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.pause('s1')
+  assert.equal(ctx.ctrl.getState().sessions[0].paused, true)
+
+  const typed = makeMsg('manual control')
+  agent.inbox.nextTurn.push(typed)
+  ctx.emit('agent/inbox/inserted', { agent, message: typed })
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'paused streak ends on typed input')
+  assert.deepEqual(agent.inbox.nextTurn, [typed])
 })
 
 test('non-user (plugin) messages are not held', async () => {
@@ -186,7 +227,7 @@ test('failure while awaiting escalates and keeps holding', async () => {
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.ctrl.retryNow('s1')
 
-  const q = makeMsg('still queued')
+  const q = makeNoSourceMsg('still queued')
   ctx.emit('agent/inbox/inserted', { agent, message: q })
   assert.equal(agent.inbox.nextTurn.length, 0)
 
@@ -205,8 +246,8 @@ test('a real completed turn releases held prompts FIFO via followup', async () =
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
 
-  const q1 = makeMsg('first')
-  const q2 = makeMsg('second')
+  const q1 = makeNoSourceMsg('first')
+  const q2 = makeNoSourceMsg('second')
   ctx.emit('agent/inbox/inserted', { agent, message: q1 })
   ctx.emit('agent/inbox/inserted', { agent, message: q2 })
 
@@ -222,7 +263,7 @@ test('a content-less completed boundary does NOT release held prompts', async ()
   const agent = makeAgent('s1')
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('held') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('held') })
 
   ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'completed')) // empty boundary
   const st = ctx.ctrl.getState()
@@ -237,7 +278,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
   let agent = makeAgent('s1')
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
   ctx.ctrl.cancel('s1')
   assert.equal(agent.followed.length, 1, 'cancel re-queues the prompt')
   assert.equal(ctx.ctrl.getState().sessions.length, 0)
@@ -247,7 +288,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
   agent = makeAgent('s2')
   ctx.agentMap.set('s2', agent)
   ctx.emit('session/event', agent.session, turnEnd('s2', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
   ctx.emit('session/event', agent.session, { type: 'user/message', data: { id: 'u1', source: { kind: 'user' } } })
   assert.equal(agent.followed.length, 1)
 
@@ -256,7 +297,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
   agent = makeAgent('s3')
   ctx.agentMap.set('s3', agent)
   ctx.emit('session/event', agent.session, turnEnd('s3', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
   await ctx.updateConfig({ enabled: false })
   assert.equal(agent.followed.length, 1)
 
@@ -265,7 +306,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
   agent = makeAgent('s4')
   ctx.agentMap.set('s4', agent)
   ctx.emit('session/event', agent.session, turnEnd('s4', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
   ctx.emit('domain/changed')
   assert.equal(ctx.ctrl.getState().sessions.length, 0)
   assert.equal(agent.followed.length, 0, 'archived sessions keep prompts cancelled')
@@ -276,7 +317,7 @@ test('assistant output while holding resets the streak and releases prompts (A3)
   const agent = makeAgent('s1')
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
 
   ctx.emit('session/event', agent.session, { type: 'assistant/message', data: {} })
   assert.equal(ctx.ctrl.getState().sessions.length, 0)
@@ -288,7 +329,7 @@ test('max-tokens failures also hold the queue and steer on time', async () => {
   const agent = makeAgent('s1')
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'max-tokens'))
-  ctx.emit('agent/inbox/inserted', { agent, message: makeMsg('q') })
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
   assert.equal(agent.inbox.nextTurn.length, 0)
   ctx.ctrl.retryNow('s1')
   assert.equal(agent.steered.length, 1)
@@ -315,4 +356,36 @@ test('an agent that disappears before firing stops cleanly', async () => {
   ctx.agentMap.delete('s1')
   ctx.ctrl.retryNow('s1')
   assert.equal(ctx.ctrl.getState().sessions.length, 0, 'entry removed with stop reason gone')
+})
+
+// ---------------------------------------------------------------- blocked / aborted
+
+test('a blocked turn re-arms the streak instead of wedging in awaiting', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1')
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.retryNow('s1') // 「繼續」 sent, phase 'awaiting'
+  assert.equal(ctx.ctrl.getState().sessions[0].phase, 'awaiting')
+
+  // A pre-step guard (capacity/rate limiter) rejects the claimed 「繼續」:
+  // the turn ends 'blocked' with the input dropped. The streak must re-arm.
+  ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'blocked'))
+  const st = ctx.ctrl.getState().sessions[0]
+  assert.ok(st, 'streak must re-arm after a blocked turn — ignoring it would wedge awaiting forever')
+  assert.equal(st.failures, 1)
+  assert.equal(st.phase, 'counting')
+})
+
+test('an aborted turn stops the streak and releases held prompts', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1')
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 1)
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'aborted'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'a cancelled turn ends the loop')
+  assert.equal(agent.followed.length, 1, 'held prompts are released on abort')
 })

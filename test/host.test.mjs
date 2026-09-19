@@ -11,7 +11,7 @@ import * as pure from '../lib/pure.js'
 // ---------------------------------------------------------------- module shape
 
 test('pure module exposes every exported helper', () => {
-  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime']) {
+  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime', 'isUserAuthored']) {
     assert.equal(typeof pure[k], 'function', `missing ${k}`)
   }
   assert.equal(typeof pure.DEFAULTS, 'object')
@@ -185,10 +185,26 @@ test('errorTextOf derives a readable reason from assorted shapes', () => {
 test('classifyStop maps stop-reason kinds to actions', () => {
   assert.equal(pure.classifyStop('error'), 'failure')
   assert.equal(pure.classifyStop('max-tokens'), 'failure')
+  // A rejected attempt (capacity/rate guards dropped the claimed input) must
+  // re-arm the streak — ignoring it would wedge the loop in 'awaiting'.
+  assert.equal(pure.classifyStop('blocked'), 'failure')
   assert.equal(pure.classifyStop('completed'), 'reset')
+  // A cancelled turn is a human stop: the loop must end, not keep retrying.
+  assert.equal(pure.classifyStop('aborted'), 'reset')
   assert.equal(pure.classifyStop('cancelled'), 'ignore')
   assert.equal(pure.classifyStop(undefined), 'ignore')
   assert.equal(pure.classifyStop('anything-else'), 'ignore')
+})
+
+// ---------------------------------------------------------------- isUserAuthored
+
+test('isUserAuthored recognizes typed user messages only', () => {
+  assert.equal(pure.isUserAuthored({ source: { kind: 'user', rpcId: 'r1' } }), true)
+  assert.equal(pure.isUserAuthored({ source: { kind: 'user' } }), true)
+  assert.equal(pure.isUserAuthored({ source: { kind: 'plugin', plugin: 'x' } }), false)
+  assert.equal(pure.isUserAuthored({ source: { kind: 'goal', round: 1 } }), false)
+  assert.equal(pure.isUserAuthored({}), false)
+  assert.equal(pure.isUserAuthored(null), false)
 })
 
 // ---------------------------------------------------------------- capStopText
