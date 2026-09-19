@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-fallback-continue",
-  "version": "1.8.0",
-  "description": "DSH (DeepSeek Harness) plugin: when a conversation turn fails, auto-send \"continue\" once and stop, escalating the retry interval on each consecutive failure and resetting on any success — unattended progress toward the goal.",
+  "version": "1.9.0",
+  "description": "DSH (DeepSeek Harness) plugin: when a conversation turn fails, auto-send \"continue\" once and stop, escalating the retry interval on each consecutive failure and resetting on any success — unattended progress toward the goal. While the retry loop is active, queued user prompts are held back so they never run ahead of the \"continue\" message.",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -58,6 +58,6 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test/host.test.mjs"
+    "test": "node --test test/host.test.mjs test/controller.test.mjs"
   }
 }
