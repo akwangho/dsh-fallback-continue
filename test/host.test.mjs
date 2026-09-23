@@ -11,7 +11,7 @@ import * as pure from '../lib/pure.js'
 // ---------------------------------------------------------------- module shape
 
 test('pure module exposes every exported helper', () => {
-  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime', 'isUserAuthored']) {
+  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime', 'isUserAuthored', 'boundaryHasContent']) {
     assert.equal(typeof pure[k], 'function', `missing ${k}`)
   }
   assert.equal(typeof pure.DEFAULTS, 'object')

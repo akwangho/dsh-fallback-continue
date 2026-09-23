@@ -115,6 +115,11 @@ test('boundaryHasContent: real work counts as content, empty boundary does not',
   // Unknown shapes are assumed to have content (over-inclusive on purpose).
   assert.equal(pure.boundaryHasContent(null), true)
   assert.equal(pure.boundaryHasContent({ data: 'weird' }), true)
+  // Real turn/end payloads carry only { turn, reason }: an empty completed
+  // boundary must read as empty so it does not release held prompts, while a
+  // max-tokens boundary obviously did work.
+  assert.equal(pure.boundaryHasContent({ type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } }), false)
+  assert.equal(pure.boundaryHasContent({ type: 'turn/end', data: { turn: 3, reason: { kind: 'max-tokens' } } }), true)
 })
 
 // ---------------------------------------------------------------- holding
@@ -497,6 +502,77 @@ test('an agent that disappears before firing stops cleanly', async () => {
   ctx.agentMap.delete('s1')
   ctx.ctrl.retryNow('s1')
   assert.equal(ctx.ctrl.getState().sessions.length, 0, 'entry removed with stop reason gone')
+})
+
+// ---------------------------------------------------------------- robustness
+
+test('a message the inbox refuses to remove is not double-held', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  // Reports the message was NOT removed (e.g. interface drift / stale id).
+  agent.inbox.remove = () => false
+  const q = makeMsg('stuck')
+  agent.inbox.nextTurn.push(q)
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  const st = ctx.ctrl.getState().sessions[0]
+  assert.equal(st.heldCount, 0, 'nothing is held when the inbox kept the message')
+  assert.deepEqual(agent.inbox.nextTurn, [q], 'the message stays pending, not copied')
+})
+
+test('a held prompt whose restore fails is retried at the next release point', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  const q = makeMsg('queued')
+  agent.inbox.nextTurn.push(q)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  // First re-insert fails (transient): the prompt must stay held, not vanish.
+  const followup = agent.followup
+  let failNext = true
+  agent.followup = (m) => {
+    if (failNext) { failNext = false; throw new Error('transient send failure') }
+    followup(m)
+  }
+  ctx.ctrl.retryNow('s1')
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 1, 'failed restore stays held')
+  assert.deepEqual(agent.followed, [])
+
+  // The next exit (cancel) retries and succeeds — input is never lost.
+  ctx.ctrl.cancel('s1')
+  assert.deepEqual(agent.followed, [q], 'retried restore re-queues the prompt')
+  assert.deepEqual(agent.inbox.nextTurn, [q])
+})
+
+test('a burst of restores past the id cap evicts the oldest, not the whole set', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  const msgs = []
+  for (let i = 0; i < 257; i++) msgs.push(makeMsg('q' + i))
+  agent.inbox.nextTurn.push(...msgs)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error')) // hold all 257
+  ctx.ctrl.retryNow('s1') // restore all 257 -> the restored-id set hits its cap
+
+  // The second-oldest id must still be recognized as our own restore. A
+  // wholesale clear of the id set would have forgotten it and read this claim
+  // as a fresh user takeover.
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: msgs[1] })
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'streak survives a burst restore')
+})
+
+test('changing the continue text applies to an already-armed streak', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  await ctx.updateConfig({ continueText: 'go on' })
+  assert.equal(ctx.ctrl.getState().sessions[0].text, 'go on', 'state reflects the new text')
+  ctx.ctrl.retryNow('s1')
+  assert.equal(agent.steered[0].content[0].text, 'go on', 'the next send uses the new text')
 })
 
 // ---------------------------------------------------------------- blocked / aborted
