@@ -43,8 +43,10 @@ function makeNoSourceMsg(text) {
 }
 
 // A minimal fake agent: an inbox with nextTurn/nextStep lists plus
-// remove/append/steer/followup recording.
-function makeAgent(id) {
+// remove/append/steer/followup recording. When `ctx` is given, steer and
+// followup publish `agent/inbox/inserted` synchronously — exactly like the
+// real durable inbox, whose splice emits the event during the send itself.
+function makeAgent(id, ctx) {
   const agent = {
     id,
     inbox: { nextTurn: [], nextStep: [] },
@@ -59,8 +61,9 @@ function makeAgent(id) {
       if (i >= 0) { agent.inbox[key].splice(i, 1); return }
     }
   }
-  agent.steer = (m) => { agent.inbox.nextStep.push(m); agent.steered.push(m) }
-  agent.followup = (m) => { agent.inbox.nextTurn.push(m); agent.followed.push(m) }
+  const publish = (m) => { if (ctx) ctx.emit('agent/inbox/inserted', { agent, message: m }) }
+  agent.steer = (m) => { agent.inbox.nextStep.push(m); agent.steered.push(m); publish(m) }
+  agent.followup = (m) => { agent.inbox.nextTurn.push(m); agent.followed.push(m); publish(m) }
   agent.session.id = id
   return agent
 }
@@ -116,7 +119,7 @@ test('boundaryHasContent: real work counts as content, empty boundary does not',
 
 test('a message typed while counting takes over: streak stops, message runs', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
 
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error')) // arm streak
@@ -141,7 +144,7 @@ test('a message typed while counting takes over: streak stops, message runs', as
 
 test('a message typed while paused also takes over (pause = manual mode)', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.ctrl.pause('s1')
@@ -156,7 +159,7 @@ test('a message typed while paused also takes over (pause = manual mode)', async
 
 test('non-user (plugin) messages are not held', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
 
@@ -170,7 +173,7 @@ test('non-user (plugin) messages are not held', async () => {
 
 test('inserted hold does nothing without an active streak or when disabled', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
 
   // No streak: prompt stays.
@@ -188,7 +191,7 @@ test('inserted hold does nothing without an active streak or when disabled', asy
 
 test('arming the streak sweeps already-queued prompts out of the inbox', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   const q1 = makeMsg('queued 1')
   const q2 = makeMsg('queued 2')
@@ -202,27 +205,103 @@ test('arming the streak sweeps already-queued prompts out of the inbox', async (
 
 // ---------------------------------------------------------------- firing
 
-test('fire steers 「繼續」 with the queue held empty (no prompt runs ahead)', async () => {
+test('fire steers 「繼續」 first, then restores the queued tasks in order', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
-  agent.inbox.nextTurn.push(makeMsg('queued early'))
+  const a = makeMsg('queued A')
+  const b = makeMsg('queued B')
+  agent.inbox.nextTurn.push(a, b)
 
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
-  assert.equal(agent.inbox.nextTurn.length, 0)
+  assert.equal(agent.inbox.nextTurn.length, 0, 'queue is held while the countdown runs')
 
   // Fire deterministically through the RPC surface instead of waiting out the
   // (short) configured countdown.
   ctx.ctrl.retryNow('s1')
   assert.equal(agent.steered.length, 1)
   assert.equal(agent.steered[0].content[0].text, '繼續')
-  assert.equal(agent.inbox.nextTurn.length, 0, 'held prompts must NOT have been released by the steer')
+  // 「繼續」 lives in next-step, which the driver claims BEFORE next-turn, so the
+  // held tasks can go straight back to the queue behind it — in their original
+  // order — instead of vanishing until the streak ends.
+  assert.deepEqual(agent.inbox.nextStep, [agent.steered[0]], '「繼續」 is the priority input')
+  assert.deepEqual(agent.inbox.nextTurn, [a, b], 'queued tasks restored FIFO behind 「繼續」')
+  assert.deepEqual(agent.followed, [a, b], 'restored via followup, in order')
   assert.equal(ctx.ctrl.getState().sessions[0].phase, 'awaiting')
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 0, 'nothing stays hidden in memory')
+})
+
+test('「繼續」 is claimed first and alone, then the restored tasks resume in order', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  agent.inbox.nextTurn.push(makeMsg('queued A'), makeMsg('queued B'))
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  // An idle driver wakes INSIDE steer() and synchronously claims at the turn
+  // boundary (all of next-step, then one next-turn — harness claim() order)
+  // BEFORE fire() restores the held queue. Capture what was claimable then.
+  const steer = agent.steer
+  let claimedAtSteer = null
+  agent.steer = (m) => {
+    steer(m)
+    const step = agent.inbox.nextStep.splice(0, agent.inbox.nextStep.length)
+    const turn = agent.inbox.nextTurn.splice(0, 1)
+    claimedAtSteer = [...step, ...turn]
+  }
+
+  ctx.ctrl.retryNow('s1')
+
+  // The held tasks were still out of the inbox when the driver woke, so
+  // 「繼續」 was the only thing claimable — nothing rides along ahead of it.
+  assert.deepEqual(claimedAtSteer.map((m) => m.content[0].text), ['繼續'])
+  // …and they are back in the queue, in original order, for the turns after it.
+  assert.deepEqual(agent.inbox.nextTurn.map((m) => m.content[0].text), ['queued A', 'queued B'])
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 0, 'nothing stays hidden in memory')
+})
+
+test('restoring the queue after 「繼續」 is not a takeover (streak survives)', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  // A USER-typed task queued before the failure: releaseHeld re-inserts it
+  // via followup, and the durable inbox publishes `agent/inbox/inserted`
+  // synchronously. Without the restore guard that insert reads as a fresh
+  // takeover and kills the streak right after every 「繼續」.
+  const a = makeMsg('queued A')
+  agent.inbox.nextTurn.push(a)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.retryNow('s1')
+
+  const st = ctx.ctrl.getState().sessions[0]
+  assert.ok(st, 'the streak must survive restoring its own queue')
+  assert.equal(st.phase, 'awaiting')
+  assert.equal(st.heldCount, 0)
+  assert.deepEqual(agent.inbox.nextTurn, [a], 'task is back in the queue, in order')
+})
+
+test('a restored task claimed later runs without killing the streak', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  const a = makeMsg('queued A')
+  agent.inbox.nextTurn.push(a)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.retryNow('s1') // 「繼續」 steered; A restored to next-turn
+
+  // The driver claims A at a later turn boundary and appends it to the log.
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: a })
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'old queued work running is not a takeover')
+  assert.equal(ctx.ctrl.getState().sessions[0].phase, 'awaiting')
+
+  // Contrast: a genuinely fresh user message on the transcript still stops it.
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: { id: 'fresh', source: { kind: 'user' } } })
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'a fresh typed message is still a takeover')
 })
 
 test('failure while awaiting escalates and keeps holding', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.ctrl.retryNow('s1')
@@ -242,7 +321,7 @@ test('failure while awaiting escalates and keeps holding', async () => {
 
 test('a real completed turn releases held prompts FIFO via followup', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
 
@@ -260,7 +339,7 @@ test('a real completed turn releases held prompts FIFO via followup', async () =
 
 test('a content-less completed boundary does NOT release held prompts', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('held') })
@@ -275,7 +354,7 @@ test('a content-less completed boundary does NOT release held prompts', async ()
 test('cancel / user takeover / disable release held prompts; archive drops them', async () => {
   // cancel
   let ctx = makeCtrl()
-  let agent = makeAgent('s1')
+  let agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -285,7 +364,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
 
   // user takeover (a user message resets the loop)
   ctx = makeCtrl()
-  agent = makeAgent('s2')
+  agent = makeAgent('s2', ctx)
   ctx.agentMap.set('s2', agent)
   ctx.emit('session/event', agent.session, turnEnd('s2', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -294,7 +373,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
 
   // disable from the settings page
   ctx = makeCtrl()
-  agent = makeAgent('s3')
+  agent = makeAgent('s3', ctx)
   ctx.agentMap.set('s3', agent)
   ctx.emit('session/event', agent.session, turnEnd('s3', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -303,7 +382,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
 
   // archived: dropped, not released (registry present before controller creation)
   ctx = makeCtrl({ getters: { workspaceRegistry: { archivedSessionIds: ['s4'] } } })
-  agent = makeAgent('s4')
+  agent = makeAgent('s4', ctx)
   ctx.agentMap.set('s4', agent)
   ctx.emit('session/event', agent.session, turnEnd('s4', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -314,7 +393,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
 
 test('assistant output while holding resets the streak and releases prompts (A3)', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -326,7 +405,7 @@ test('assistant output while holding resets the streak and releases prompts (A3)
 
 test('max-tokens failures also hold the queue and steer on time', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'max-tokens'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
@@ -337,7 +416,7 @@ test('max-tokens failures also hold the queue and steer on time', async () => {
 
 test('an agent without inbox/remove falls back to old behavior without crashing', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   delete agent.inbox.remove
   ctx.agentMap.set('s1', agent)
   agent.inbox.nextTurn.push(makeMsg('q'))
@@ -350,7 +429,7 @@ test('an agent without inbox/remove falls back to old behavior without crashing'
 
 test('an agent that disappears before firing stops cleanly', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.agentMap.delete('s1')
@@ -362,7 +441,7 @@ test('an agent that disappears before firing stops cleanly', async () => {
 
 test('a blocked turn re-arms the streak instead of wedging in awaiting', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.ctrl.retryNow('s1') // 「繼續」 sent, phase 'awaiting'
@@ -379,7 +458,7 @@ test('a blocked turn re-arms the streak instead of wedging in awaiting', async (
 
 test('an aborted turn stops the streak and releases held prompts', async () => {
   const ctx = makeCtrl()
-  const agent = makeAgent('s1')
+  const agent = makeAgent('s1', ctx)
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
