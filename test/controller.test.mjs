@@ -6,9 +6,11 @@
 //   - a message TYPED by the user during the streak is an explicit takeover:
 //     the streak stops, held prompts are released, and the typed message
 //     runs — it is never swallowed silently;
-//   - 「繼續」 is steered with the queue empty, and nothing is released early;
-//   - held prompts return FIFO only after a real completed turn (and never
-//     after a content-less completed boundary);
+//   - 「繼續」 is steered with the queue empty, then the held prompts go right
+//     back behind it (FIFO, original order) — they do not wait for the streak
+//     to end, so queued work never looks like it vanished;
+//   - a real completed turn (and never a content-less completed boundary)
+//     releases anything still held;
 //   - a blocked turn re-arms the streak (no wedge) and an aborted turn stops
 //     the loop;
 //   - any other exit (cancel, user takeover, disable, ...) still releases
@@ -258,6 +260,66 @@ test('「繼續」 is claimed first and alone, then the restored tasks resume in
   // …and they are back in the queue, in original order, for the turns after it.
   assert.deepEqual(agent.inbox.nextTurn.map((m) => m.content[0].text), ['queued A', 'queued B'])
   assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 0, 'nothing stays hidden in memory')
+})
+
+test('queued tasks survive the whole continue cycle and run FIFO (real claim model)', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  const a = makeMsg('queued A')
+  const b = makeMsg('queued B')
+  agent.inbox.nextTurn.push(a, b)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  // Faithful driver boundary: drains ALL of next-step, then one next-turn.
+  const claimBoundary = (target) => {
+    const batch = agent.inbox.nextStep.splice(0, agent.inbox.nextStep.length)
+    if (target === 'next-turn') batch.push(...agent.inbox.nextTurn.splice(0, 1))
+    return batch
+  }
+  // An idle driver wakes synchronously inside steer() and claims before
+  // fire() restores the held queue.
+  const steer = agent.steer
+  const steeredBatch = []
+  agent.steer = (m) => {
+    steer(m)
+    steeredBatch.push(claimBoundary('next-turn'))
+  }
+
+  ctx.ctrl.retryNow('s1')
+  assert.deepEqual(steeredBatch[0].map((m) => m.content[0].text), ['繼續'], '「繼續」 is claimed alone')
+  assert.deepEqual(agent.inbox.nextTurn, [a, b], 'both queued tasks are back, in original order')
+
+  // Each following turn claims the next queued task, one per turn, FIFO — and
+  // running previously-queued work is not mistaken for a user takeover.
+  const first = claimBoundary('next-turn')
+  assert.deepEqual(first.map((m) => m.content[0].text), ['queued A'])
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: first[0] })
+  const second = claimBoundary('next-turn')
+  assert.deepEqual(second.map((m) => m.content[0].text), ['queued B'])
+  ctx.emit('session/event', agent.session, { type: 'user/message', data: second[0] })
+
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'the streak survives the whole restored queue')
+  assert.equal(agent.inbox.nextTurn.length, 0, 'nothing is left behind or duplicated')
+})
+
+test('a mixed nextStep/nextTurn hold is restored in original claim order', async () => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  const s = makeMsg('steered user')
+  const t = makeMsg('queued user')
+  agent.inbox.nextStep.push(s) // next-step is claimed before next-turn
+  agent.inbox.nextTurn.push(t)
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.retryNow('s1')
+
+  assert.deepEqual(
+    agent.inbox.nextTurn.map((m) => m.content[0].text),
+    ['steered user', 'queued user'],
+    'hold order follows the driver claim priority, so the restore is not inverted',
+  )
 })
 
 test('restoring the queue after 「繼續」 is not a takeover (streak survives)', async () => {
