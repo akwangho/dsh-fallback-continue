@@ -64,16 +64,45 @@ dsh plugin --profile web add github:akwangho/dsh-fallback-continue
 ## 檔案結構
 
 - `package.json` — npm package（含 `dsh.client` metadata）與唯一版本號來源。
+- `locale/en.json`、`locale/zh.json` — 外掛在「設定 → 外掛」清單中的顯示名稱與說明。
 - `lib/index.js` — Host 半部（Typert `fallbackContinue` Remote 服務與插件裝配）。
 - `lib/controller.js` — 狀態機本體：失敗偵測、遞增間隔、排隊提示詞保留／放行、優先插隊送「繼續」、停止條件。
 - `lib/pure.js` — 純函式（intervalFor/normalizeConfig/DEFAULTS/boundaryHasContent 等），無相依、可直接單元測試。
-- `lib/client.js` — Client 半部（右下角倒數、設定卡、等待清單）。
-- `test/host.test.mjs`、`test/controller.test.mjs` — 純函式與狀態機的單元測試（`npm test`）。
+- `lib/client.js` — Client 半部（右下角倒數、設定卡、等待清單、自我診斷）。
+- `test/host.test.mjs`、`test/controller.test.mjs`、`test/manifest.test.mjs` — 純函式、狀態機與 manifest 相容性的單元測試（`npm test`）。
+
+## DSH 版本相容性
+
+DSH 在掛載 profile 外掛前會先做**相容性預檢**：讀取外掛 `package.json` 的 `peerDependencies`（不執行任何外掛程式碼），把名稱為 `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 開頭的 peer 逐一與目前 DSH 版本比對。**只要有一個不符合，整個外掛就會被停用**，stderr 印一行然後外掛在 UI 上完全消失：
+
+```text
+dsh: disabling profile plugin row "fallback-continue": Plugin
+dsh-plugin-fallback-continue@1.9.4 is incompatible with dsh 0.2.0-rc.2: peerDependencies {...}
+```
+
+這正是 1.9.x 在 DSH 從 0.1.x 升到 0.2.x 之後「看不見」的原因：peer 被寫成 `^0.1.0-rc.6`，而 0.x 的 caret 只允許同一個 minor。
+
+因此本外掛的 `@deepseek-ai/dsh-*` peer 一律使用涵蓋整條 0.x 的明確範圍（`>=0.1.0-rc.6 <1.0.0`），不再使用 caret／tilde。`test/manifest.test.mjs` 會直接對 `package.json` 守住這條規則，確保下次 DSH 升級不會又無聲消失。
+
+- 已驗證可載入的 DSH 版本：`0.1.0-rc.6`、`0.1.0-rc.8`、`0.2.0-rc.2`、`0.2.0`、`0.3.0-rc.1`、`0.9.9`。
+- DSH `1.x` 刻意不相容：那時需要重新稽核 API，再依 audit 結果放寬。
+- `@deepseek-ai/dsh-client-runtime` 在 0.2 已移除，已從 `dsh.client.inject` 移除。
+- 這些 peer 在執行時都由 DSH host 提供，因此標記為 optional peer，`npm install` 不會把它們抓進本機 `node_modules`。
+- 想略過預檢（不建議）：`dsh plugin allow-version` 為 `dsh-plugin-fallback-continue@<版本>` 開豁免。
+
+## 自我診斷
+
+外掛若載入失敗，**不會再無聲消失**：
+
+- 設定頁頂端／底部會列出紅色診斷（缺少 `connection`／`slots`、RPC 連不到 host、slot 註冊失敗等）。
+- 連設定頁都註冊不起來時，畫面左下角會出現一個固定的小紅框寫著第一條問題。
+- 各個 UI 註冊彼此獨立：其中一項失敗不會連帶讓其他項消失。
 
 ## 注意事項
 
 - 重啟 DSH 程序後，等待中的倒數會重來（狀態只在記憶體，不跨程序留存）。
 - 「繼續」以 steering（插隊）方式送出：對閒置中的 agent 會直接開始新 turn。配合排隊提示詞保留，送出當下 inbox 已清空，所以「繼續」一定是 driver 下一個領取的輸入，用來先完成尚未完成的任務。
- - 有些失敗是確定性的（例如模型不支援那麼大的 token 數），重試永遠不會成功——這種請手動處理（換模型或調參數），不要等自動繼續。
- - 更新程式後需重啟 `dsh web` 才會生效。
+- 有些失敗是確定性的（例如模型不支援那麼大的 token 數），重試永遠不會成功——這種請手動處理（換模型或調參數），不要等自動繼續。
+- 設定持久化走 DSH 的 `settings` service（`installSection`）。若您的 DSH 版本已改用新的設定機制（volatile Config + profile patch），開關不會跨重啟保留——此時請把 `cordis.patch.yml` 的 `fallback-continue` 項目直接設為啟用。
+- 更新程式後需重啟 `dsh web` 才會生效。
 

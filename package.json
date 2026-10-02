@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-fallback-continue",
-  "version": "1.9.4",
+  "version": "1.10.0",
   "description": "DSH (DeepSeek Harness) plugin: when a conversation turn fails, auto-send \"continue\" once and stop, escalating the retry interval on each consecutive failure and resetting on any success — unattended progress toward the goal. While the retry loop is active, queued user prompts are held back so they never run ahead of the \"continue\" message.",
   "keywords": [
     "dsh",
@@ -26,10 +26,12 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./locale/*": "./locale/*",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "locale",
     "README.md",
     "LICENSE"
   ],
@@ -40,7 +42,6 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-locale"
@@ -48,16 +49,24 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
-    "react": "^18.2.0"
+    "@deepseek-ai/cordis": ">=4.0.1 <5.0.0",
+    "@deepseek-ai/dsh-client-connection": ">=0.1.0-rc.6 <1.0.0",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.0-rc.6 <1.0.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-rc.6 <1.0.0",
+    "react": ">=18.2.0 <20.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-client-connection": { "optional": true },
+    "@deepseek-ai/dsh-client-ui-slots": { "optional": true },
+    "@deepseek-ai/dsh-typert-protocol": { "optional": true },
+    "react": { "optional": true }
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "dsh": ">=0.1.0-rc.6 <1.0.0"
   },
   "scripts": {
-    "test": "node --test test/host.test.mjs test/controller.test.mjs"
+    "test": "node --test test/host.test.mjs test/controller.test.mjs test/manifest.test.mjs"
   }
 }

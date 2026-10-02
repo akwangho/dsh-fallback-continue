@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Fail auto-continue",
+    "description": "When a conversation turn fails, automatically sends \"continue\" once and waits, escalating the retry interval on each consecutive failure and resetting on any success. An API 429 rate limit switches to a long cooldown instead of hammering the provider. While the loop is active, queued prompts are held back so they never run ahead of the continue message."
+  }
+}
