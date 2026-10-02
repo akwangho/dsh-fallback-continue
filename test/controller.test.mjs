@@ -72,6 +72,7 @@ function makeAgent(id, ctx) {
 
 function makeCtx() {
   const listeners = new Map()
+  const disposers = []
   const ctx = {
     agents: { get: (id) => ctx.agentMap.get(String(id)) },
     agentMap: new Map(),
@@ -85,7 +86,22 @@ function makeCtx() {
       for (const fn of listeners.get(event) || []) fn(...args)
     },
     inject() {},
-    effect() { return () => {} },
+    // Capture teardown callbacks so a test can stop the controller. The
+    // controller arms real `setTimeout`s, and a default interval is measured in
+    // MINUTES — without disposal such a timer would keep the test runner alive
+    // long after the assertions passed.
+    effect(cb) {
+      const dispose = cb()
+      if (typeof dispose === 'function') disposers.push(dispose)
+      return dispose || (() => {})
+    },
+    dispose() {
+      while (disposers.length > 0) {
+        const d = disposers.pop()
+        try { d() } catch (_) {}
+      }
+      listeners.clear()
+    },
   }
   return ctx
 }
@@ -93,10 +109,31 @@ function makeCtx() {
 function makeCtrl({ enabled = true, intervals = [0.02], getters = {} } = {}) {
   const ctx = makeCtx()
   ctx.getters = getters
-  const ctrl = createController(ctx, { version: 'test' })
+
+  // Configuration is ordinary DSH plugin Config now (declared volatile in
+  // lib/index.js), so the controller receives it the way the Loader passes it:
+  // one reference per field, read with `.get()`. Mutating a field here and then
+  // dispatching `loader/volatile-update` is exactly how a settings-page edit
+  // reaches a running plugin — the values commit into the references WITHOUT a
+  // remount, so in-flight countdowns and held queues must survive.
+  const values = {
+    enabled,
+    continueText: pure.DEFAULTS.continueText,
+    retryIntervalsMinutes: intervals,
+    capEnabled: pure.DEFAULTS.capEnabled,
+    capHours: pure.DEFAULTS.capHours,
+    cooldownMinutes: pure.DEFAULTS.cooldownMinutes,
+  }
+  const refs = {}
+  for (const [field, value] of Object.entries(values)) refs[field] = { get: () => values[field] }
+
+  const ctrl = createController(ctx, { version: 'test', config: refs })
   ctx.ctrl = ctrl
-  ctx.updateConfig = (patch) => ctrl.updateConfig(patch)
-  if (enabled) ctx.updateConfig({ enabled: true, retryIntervalsMinutes: intervals })
+  ctx.configValues = values
+  ctx.setConfig = (patch) => {
+    Object.assign(values, patch)
+    ctx.emit('loader/volatile-update', [Object.keys(patch)])
+  }
   return ctx
 }
 
@@ -189,7 +226,7 @@ test('inserted hold does nothing without an active streak or when disabled', asy
   assert.equal(agent.inbox.nextTurn.length, 1)
 
   // Streak, but plugin disabled: prompt stays.
-  await ctx.updateConfig({ enabled: false })
+  ctx.setConfig({ enabled: false })
   const b = makeMsg('b')
   agent.inbox.nextTurn.push(b)
   ctx.emit('agent/inbox/inserted', { agent, message: b })
@@ -444,7 +481,7 @@ test('cancel / user takeover / disable release held prompts; archive drops them'
   ctx.agentMap.set('s3', agent)
   ctx.emit('session/event', agent.session, turnEnd('s3', 1, 'error'))
   ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
-  await ctx.updateConfig({ enabled: false })
+  ctx.setConfig({ enabled: false })
   assert.equal(agent.followed.length, 1)
 
   // archived: dropped, not released (registry present before controller creation)
@@ -569,7 +606,7 @@ test('changing the continue text applies to an already-armed streak', async () =
   ctx.agentMap.set('s1', agent)
   ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
 
-  await ctx.updateConfig({ continueText: 'go on' })
+  ctx.setConfig({ continueText: 'go on' })
   assert.equal(ctx.ctrl.getState().sessions[0].text, 'go on', 'state reflects the new text')
   ctx.ctrl.retryNow('s1')
   assert.equal(agent.steered[0].content[0].text, 'go on', 'the next send uses the new text')
@@ -605,4 +642,124 @@ test('an aborted turn stops the streak and releases held prompts', async () => {
   ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'aborted'))
   assert.equal(ctx.ctrl.getState().sessions.length, 0, 'a cancelled turn ends the loop')
   assert.equal(agent.followed.length, 1, 'held prompts are released on abort')
+})
+
+// ------------------------------------------------- volatile Config (v1.11.0)
+
+test('config is read from Loader references, not from a private copy', (t) => {
+  // `enabled` false at construction: the loop must stay inert even though a
+  // failure event arrives.
+  const ctx = makeCtrl({ enabled: false })
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'disabled plugin arms nothing')
+
+  // Enabling must NOT retroactively arm a streak for a failure that already
+  // happened: that turn is long over, and firing 「繼續」 at it now would be
+  // wrong. The loop arms on the NEXT failure instead.
+  ctx.setConfig({ enabled: true })
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'enabling does not resurrect an old failure')
+  assert.equal(ctx.ctrl.getState().config.enabled, true, 'config reflects the committed value')
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'error'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'the next failure arms the streak')
+})
+
+test('disabling through a volatile commit stops the streak and releases held prompts', (t) => {
+  const ctx = makeCtrl()
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  const queued = makeNoSourceMsg('q')
+  agent.inbox.nextTurn.push(queued)
+  ctx.emit('agent/inbox/inserted', { agent, message: queued })
+  assert.equal(agent.inbox.nextTurn.length, 0, 'queued prompt is held while the streak runs')
+
+  ctx.setConfig({ enabled: false })
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'streak dropped')
+  assert.equal(agent.followed.length, 1, 'held prompt is returned, never lost')
+  assert.equal(agent.inbox.nextTurn[0].content[0].text, 'q')
+})
+
+test('an in-flight countdown survives a config edit (no remount, no reset)', (t) => {
+  const ctx = makeCtrl({ intervals: [5] })
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  const before = ctx.ctrl.getState().sessions[0]
+  assert.equal(before.failures, 0)
+  assert.equal(before.remainingMs, 5 * 60000, 'first failure uses the first interval slot')
+
+  // A volatile edit re-reads config and re-arms, but must NOT reset the streak
+  // to failure #0: the escalation the user already earned is kept.
+  ctx.setConfig({ continueText: 'go on' })
+  const after = ctx.ctrl.getState().sessions[0]
+  assert.equal(after.failures, 0, 'streak position preserved across the edit')
+  assert.equal(after.text, 'go on', 'new text adopted')
+  assert.ok(after.remainingMs > 0 && after.remainingMs <= 5 * 60000, 'countdown is live again')
+})
+
+test('a volatile cooldown edit is picked up by the next send', (t) => {
+  const ctx = makeCtrl()
+  // The default cooldown is 720 MINUTES; dispose so that timer cannot outlive
+  // the test and hold the runner open.
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, {
+    type: 'turn/end', id: 's1', data: { turn: 1, reason: { kind: 'error', error: { code: 'RATE_LIMIT' } } },
+  })
+  assert.equal(ctx.ctrl.getState().sessions[0].cooling, true)
+  assert.equal(ctx.ctrl.getState().config.cooldownMinutes, 720)
+
+  ctx.setConfig({ cooldownMinutes: 60 })
+  assert.equal(ctx.ctrl.getState().config.cooldownMinutes, 60, 'config reflects the committed value')
+  const entry = ctx.ctrl.getState().sessions[0]
+  assert.equal(entry.remainingMs, 60 * 60000, 'the cooldown countdown uses the new interval')
+})
+
+test('a settings/document-updated event for our namespace re-reads config', (t) => {
+  const ctx = makeCtrl()
+  t.after(() => ctx.dispose())
+
+  // Mutate the reference WITHOUT the Loader event, so the only thing that can
+  // make the controller notice is the settings-service notification.
+  ctx.configValues.continueText = 'changed underneath'
+  assert.equal(ctx.ctrl.getState().config.continueText, pure.DEFAULTS.continueText, 'not observed yet')
+
+  // Another plugin's namespace must not be mistaken for ours.
+  ctx.emit('settings/document-updated', 'some-other-plugin', 3)
+  assert.equal(ctx.ctrl.getState().config.continueText, pure.DEFAULTS.continueText, 'foreign namespace ignored')
+
+  ctx.emit('settings/document-updated', 'fallback-continue', 4)
+  assert.equal(ctx.ctrl.getState().config.continueText, 'changed underneath', 'our namespace re-reads config')
+})
+
+test('plain-value config (no references) is accepted, keeping the controller testable', () => {
+  const ctx = makeCtx()
+  const ctrl = createController(ctx, {
+    version: 'test',
+    config: { enabled: true, continueText: 'plain', retryIntervalsMinutes: [1], capEnabled: false, capHours: 0, cooldownMinutes: 30 },
+  })
+  const c = ctrl.getState().config
+  assert.equal(c.enabled, true)
+  assert.equal(c.continueText, 'plain')
+  assert.deepEqual(c.retryIntervalsMinutes, [1])
+  assert.equal(c.capEnabled, false)
+  assert.equal(c.capHours, 0)
+  assert.equal(c.cooldownMinutes, 30)
+})
+
+test('a throwing config reference degrades to the default instead of crashing', () => {
+  const ctx = makeCtx()
+  const ctrl = createController(ctx, {
+    version: 'test',
+    config: { enabled: { get() { throw new Error('ref exploded') } } },
+  })
+  assert.equal(ctrl.getState().config.enabled, pure.DEFAULTS.enabled)
 })

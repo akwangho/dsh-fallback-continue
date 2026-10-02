@@ -195,3 +195,73 @@ test('locale/en.json exists and is exported, so the Plugins list can name it', (
   assert.equal(typeof zh.meta.title, 'string')
   assert.ok(zh.meta.title.length > 0)
 })
+
+// ------------------------------------------------- volatile Config declaration
+
+test('the host half exports a Config whose fields are all volatile', async () => {
+  // DSH's settings service projects ONLY volatile fields into an editable form
+  // (dsh-settings `volatileForm`). A non-volatile field would be validated and
+  // persisted but could not be edited from this plugin's settings page, and an
+  // ordinary field change would remount the plugin — discarding in-flight
+  // countdowns and held prompt queues.
+  const [{ configSchema }, z] = await Promise.all([
+    import('../lib/config.js'),
+    import('@deepseek-ai/schemastery'),
+  ])
+  const { CONFIG_FIELDS } = await import('../lib/config.js')
+  const json = configSchema(z.default ?? z).toJSON()
+  // Schemastery serializes to a ref table: the root object ref carries a `dict`
+  // mapping each field name to its own ref id.
+  const dict = json.refs[json.uid].dict
+  assert.deepEqual(Object.keys(dict), CONFIG_FIELDS, 'Config fields drifted from CONFIG_FIELDS')
+  for (const field of CONFIG_FIELDS) {
+    const ref = json.refs[dict[field]]
+    assert.ok(ref, `Config is missing the ${field} field`)
+    assert.equal(ref.meta.volatile, true, `Config.${field} must be .volatile() to be editable and live`)
+    assert.ok(ref.meta.default !== undefined, `Config.${field} must declare a default`)
+  }
+})
+
+test('Config defaults match the pure DEFAULTS, so the schema cannot drift', async () => {
+  const [{ configSchema }, pure, z] = await Promise.all([
+    import('../lib/config.js'),
+    import('../lib/pure.js'),
+    import('@deepseek-ai/schemastery'),
+  ])
+  const json = configSchema(z.default ?? z).toJSON()
+  const dict = json.refs[json.uid].dict
+  const read = (field) => json.refs[dict[field]].meta.default
+  assert.equal(read('enabled'), pure.DEFAULTS.enabled)
+  assert.equal(read('continueText'), pure.DEFAULTS.continueText)
+  assert.deepEqual(read('retryIntervalsMinutes'), pure.DEFAULTS.retryIntervalsMinutes)
+  assert.equal(read('capEnabled'), pure.DEFAULTS.capEnabled)
+  assert.equal(read('capHours'), pure.DEFAULTS.capHours)
+  assert.equal(read('cooldownMinutes'), pure.DEFAULTS.cooldownMinutes)
+})
+
+test('the settings namespace matches the documented profile entry id', async () => {
+  // DSH keys every settings form by the profile entry id, and the browser half
+  // addresses the same string. Both must agree with what the README tells users
+  // to put in cordis.patch.yml.
+  const { SETTINGS_NS } = await import('../lib/config.js')
+  assert.equal(SETTINGS_NS, 'fallback-continue')
+
+  const clientSrc = readFileSync(join(ROOT, 'lib', 'client.js'), 'utf8')
+  const match = /const SETTINGS_NS = '([^']+)'/.exec(clientSrc)
+  assert.ok(match, 'lib/client.js must declare SETTINGS_NS')
+  assert.equal(match[1], SETTINGS_NS, 'client and host namespaces must match')
+})
+
+test('the removed settings API is not referenced any more', () => {
+  // `settings.installSection` and `settings.replace` no longer exist in DSH 0.2;
+  // calling them silently disabled persistence. Config now flows through the
+  // volatile Config schema and the settings service. Comments are stripped so
+  // the prose that explains this removal does not trip the check.
+  const stripComments = (src) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+  for (const file of ['lib/index.js', 'lib/controller.js', 'lib/client.js']) {
+    const src = stripComments(readFileSync(join(ROOT, file), 'utf8'))
+    assert.doesNotMatch(src, /installSection/, `${file} still calls the removed settings.installSection`)
+    assert.doesNotMatch(src, /settings\.replace\(/, `${file} still calls the removed settings.replace`)
+  }
+})

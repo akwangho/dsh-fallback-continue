@@ -21,7 +21,7 @@
 - **上限停止記錄**：超過上限停止時，會在該會話的對話記錄中寫入一則通知訊息（⛔ 自動繼續已停止…），讓使用者能看到無人值守循環為何完全停止。
 - **429 限流冷卻**：若最後一次失敗是 API 429（Rate Limit，`code === RATE_LIMIT` 或 HTTP 429），**不停止**，改為固定間隔（`cooldownMinutes`，預設 720 分鐘，可在 UI 設定）送出「繼續」以冷卻；連續 429 維持此間隔，回復正常後自動切回原遞增間隔。進入冷卻時在會話寫入通知（含本次 429 **發生時間**與**預計下次送出時間**）。冷卻期間排隊提示詞同樣被保留。
 - **空轉防護**：保留提示詞期間，driver 偶爾會關閉一個沒有內容的 completed 邊界 turn（排程收斂的副產物）。這種 turn 不算成功——不會重置連續失敗、也不會提前放行保留中的提示詞；只有真正有輸入／輸出的完成才會放行。
-- **持久化**：設定（啟用開關、文字、間隔、上限、冷卻間隔）透過 `settings` service 存到 `fallback-continue` namespace，重啟 `dsh web` 後仍保留。
+- **持久化**：設定是**一般的 DSH volatile Config**（見下方「設定如何儲存」），重啟 `dsh web` 後仍保留。
 - **保留提示詞的持久性限制**：保留中的提示詞放在外掛的記憶體佇列裡，但保留時間很短——只在「失敗倒數中」到「『繼續』插隊送出」之間；送出後立即歸位，等待中的每一輪也都會在送「繼續」時歸位。正常停止（成功、取消、接管、關閉外掛、`dsh web` 正常重啟）都會即時放回 inbox，不會遺失；僅**程序異常終止**（crash／強制 kill）且恰好在倒數期間，該輪保留佇列才無法回放。
 - **多語 UI**：繁中／簡中／英文（透過 `locale` service）。
 
@@ -61,15 +61,30 @@ dsh plugin --profile web add github:akwangho/dsh-fallback-continue
 
 最後重啟 `dsh web` 生效。（若只是本機目錄測試，也可直接複製 `lib/` 與 `package.json` 到 `node_modules/dsh-plugin-fallback-continue/`。）
 
+## 設定如何儲存（volatile Config）
+
+設定**不再**由外掛自建 namespace 存放，而是走 DSH 標準的 plugin Config 機制：
+
+- `lib/config.js` 宣告 `Config`，六個欄位全部 `.volatile()`。volatile 有兩個關鍵效果：
+  1. DSH 的 `settings` service **只**把 volatile 欄位投影成可編輯表單，所以設定頁才存得下。
+  2. Loader 會把變更**寫進執行中的 reference**（`loader/volatile-update`）而**不重新掛載外掛**——所以你在設定頁改開關或間隔時，正在倒數的計時與保留中的提示詞都不會被清掉。
+- 儲存位置就是 profile 的 `cordis.patch.yml`（DSH 自己寫回），不是外掛的檔案。
+- Host 半部只**讀取** config，並在 `loader/volatile-update` 或 `settings/document-updated` 時重新讀取並套用到進行中的循環。瀏覽器半部透過 `ctx.configForms.get('fallback-continue')` 讀寫，跟第一方外掛（如 `dsh-client-ui-theme`）用的是同一套路徑。
+- 外掛呼叫 `settings.configure({ auto: false }, ctx.fiber)`，告訴 DSH「這支外掛自帶設定頁」，避免 DSH 再自動產生一份重複表單。
+- **namespace 必須等於 profile entry id**，也就是 `cordis.patch.yml` 裡的 `id: fallback-continue`。若你改了 id，設定頁會顯示紅色診斷而不是安靜地存不進去。
+- 排程相關的設定（重試間隔、冷卻間隔、上限）一改，**已經在倒數的計時會立即改用新值**重新計算，不會繼續倒舊的數字。
+- 啟用外掛**不會**回溯補送已經發生的失敗（那個 turn 早就結束了）；要在**下一次**失敗才開始循環。
+
 ## 檔案結構
 
 - `package.json` — npm package（含 `dsh.client` metadata）與唯一版本號來源。
 - `locale/en.json`、`locale/zh.json` — 外掛在「設定 → 外掛」清單中的顯示名稱與說明。
-- `lib/index.js` — Host 半部（Typert `fallbackContinue` Remote 服務與插件裝配）。
+- `lib/index.js` — Host 半部（匯出 `Config`、Typert `fallbackContinue` Remote 服務與插件裝配）。
+- `lib/config.js` — Config schema（volatile 欄位）與 settings namespace，無 Host 相依、可直接單元測試。
 - `lib/controller.js` — 狀態機本體：失敗偵測、遞增間隔、排隊提示詞保留／放行、優先插隊送「繼續」、停止條件。
 - `lib/pure.js` — 純函式（intervalFor/normalizeConfig/DEFAULTS/boundaryHasContent 等），無相依、可直接單元測試。
 - `lib/client.js` — Client 半部（右下角倒數、設定卡、等待清單、自我診斷）。
-- `test/host.test.mjs`、`test/controller.test.mjs`、`test/manifest.test.mjs` — 純函式、狀態機與 manifest 相容性的單元測試（`npm test`）。
+- `test/host.test.mjs`、`test/controller.test.mjs`、`test/manifest.test.mjs` — 純函式、狀態機、Config schema 與 manifest 相容性的單元測試（`npm test`）。
 
 ## DSH 版本相容性
 
@@ -103,6 +118,5 @@ dsh-plugin-fallback-continue@1.9.4 is incompatible with dsh 0.2.0-rc.2: peerDepe
 - 重啟 DSH 程序後，等待中的倒數會重來（狀態只在記憶體，不跨程序留存）。
 - 「繼續」以 steering（插隊）方式送出：對閒置中的 agent 會直接開始新 turn。配合排隊提示詞保留，送出當下 inbox 已清空，所以「繼續」一定是 driver 下一個領取的輸入，用來先完成尚未完成的任務。
 - 有些失敗是確定性的（例如模型不支援那麼大的 token 數），重試永遠不會成功——這種請手動處理（換模型或調參數），不要等自動繼續。
-- 設定持久化走 DSH 的 `settings` service（`installSection`）。若您的 DSH 版本已改用新的設定機制（volatile Config + profile patch），開關不會跨重啟保留——此時請把 `cordis.patch.yml` 的 `fallback-continue` 項目直接設為啟用。
 - 更新程式後需重啟 `dsh web` 才會生效。
 
