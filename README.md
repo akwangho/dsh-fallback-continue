@@ -84,7 +84,7 @@ dsh plugin --profile web add github:akwangho/dsh-fallback-continue
 - `lib/controller.js` — 狀態機本體：失敗偵測、遞增間隔、排隊提示詞保留／放行、優先插隊送「繼續」、停止條件。
 - `lib/pure.js` — 純函式（intervalFor/normalizeConfig/DEFAULTS/boundaryHasContent 等），無相依、可直接單元測試。
 - `lib/client.js` — Client 半部（右下角倒數、設定卡、等待清單、自我診斷）。
-- `test/host.test.mjs`、`test/controller.test.mjs`、`test/manifest.test.mjs` — 純函式、狀態機、Config schema 與 manifest 相容性的單元測試（`npm test`）。
+- `test/host.test.mjs`、`test/controller.test.mjs`、`test/manifest.test.mjs`、`test/client.test.mjs` — 純函式、狀態機、Config schema、manifest 相容性與 Client 半部（浮動視窗）的單元測試（`npm test`）。
 
 ## DSH 版本相容性
 
@@ -102,6 +102,7 @@ dsh-plugin-fallback-continue@1.9.4 is incompatible with dsh 0.2.0-rc.2: peerDepe
 - 已驗證可載入的 DSH 版本：`0.1.0-rc.6`、`0.1.0-rc.8`、`0.2.0-rc.2`、`0.2.0`、`0.3.0-rc.1`、`0.9.9`。
 - DSH `1.x` 刻意不相容：那時需要重新稽核 API，再依 audit 結果放寬。
 - `@deepseek-ai/dsh-client-runtime` 在 0.2 已移除，已從 `dsh.client.inject` 移除。
+- Client 的 sessions store 在 0.2 移除了 `SessionListState.current`：目前開啟的會話改由 `byId[*].retainedBy.mainView > 0` 判定（與內建 AppFrame／DocumentTitle 相同掃描）。浮動視窗先前讀 `s.current`，因此在 0.2 找不到當前會話而完全不顯示——只剩設定頁能暫停／取消。`test/client.test.mjs` 用 0.2 的 snapshot 形狀守住這條路徑。
 - 這些 peer 在執行時都由 DSH host 提供，因此標記為 optional peer，`npm install` 不會把它們抓進本機 `node_modules`。
 - 想略過預檢（不建議）：`dsh plugin allow-version` 為 `dsh-plugin-fallback-continue@<版本>` 開豁免。
 
