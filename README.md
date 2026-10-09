@@ -24,6 +24,7 @@
 - **持久化**：設定是**一般的 DSH volatile Config**（見下方「設定如何儲存」），重啟 `dsh web` 後仍保留。
 - **保留提示詞的持久性限制**：保留中的提示詞放在外掛的記憶體佇列裡，但保留時間很短——只在「失敗倒數中」到「『繼續』插隊送出」之間；送出後立即歸位，等待中的每一輪也都會在送「繼續」時歸位。正常停止（成功、取消、接管、關閉外掛、`dsh web` 正常重啟）都會即時放回 inbox，不會遺失；僅**程序異常終止**（crash／強制 kill）且恰好在倒數期間，該輪保留佇列才無法回放。
 - **多語 UI**：繁中／簡中／英文（透過 `locale` service）。
+- **Session format v4 訊息**：外掛送出的「繼續」與所有通知訊息都帶有 v4 要求的 producer-owned source（`source: { kind: 'plugin:dsh-plugin-fallback-continue' }`；通知另帶 `form: 'notice'` 與 ≤120 字的 `summary`）。DSH 0.2 的 v4 codec 會**拒絕**舊的 v3 包裝 `{ kind: 'plugin', plugin }`（讀寫皆然），一則這樣的訊息會讓整個 session log 無法持久化；`test/controller.test.mjs` 釘住這個形狀。
 
 ## 可設定項目
 

@@ -11,10 +11,14 @@ import * as pure from '../lib/pure.js'
 // ---------------------------------------------------------------- module shape
 
 test('pure module exposes every exported helper', () => {
-  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime', 'isUserAuthored', 'boundaryHasContent']) {
+  for (const k of ['normalizeConfig', 'intervalFor', 'overCap', 'remainingMs', 'errorTextOf', 'classifyStop', 'capStopText', 'isRateLimited', 'rateLimitedText', 'formatStopTime', 'isUserAuthored', 'boundaryHasContent', 'boundNoticeSummary']) {
     assert.equal(typeof pure[k], 'function', `missing ${k}`)
   }
   assert.equal(typeof pure.DEFAULTS, 'object')
+  // The producer-owned source kind DSH session format v4 requires: a plugin
+  // names itself as `plugin:<package>`; the v3 `{ kind: 'plugin', plugin }`
+  // wrapper is retired and refused by the v4 codec on write AND read.
+  assert.equal(pure.PLUGIN_SOURCE_KIND, 'plugin:dsh-plugin-fallback-continue')
 })
 
 // ---------------------------------------------------------------- intervalFor
@@ -202,9 +206,30 @@ test('isUserAuthored recognizes typed user messages only', () => {
   assert.equal(pure.isUserAuthored({ source: { kind: 'user', rpcId: 'r1' } }), true)
   assert.equal(pure.isUserAuthored({ source: { kind: 'user' } }), true)
   assert.equal(pure.isUserAuthored({ source: { kind: 'plugin', plugin: 'x' } }), false)
+  // The v4 producer-owned plugin kind, and this plugin's own messages, are
+  // never "typed by the human" — so they never read as a takeover.
+  assert.equal(pure.isUserAuthored({ source: { kind: pure.PLUGIN_SOURCE_KIND } }), false)
+  assert.equal(pure.isUserAuthored({ source: { kind: 'plugin:x' } }), false)
   assert.equal(pure.isUserAuthored({ source: { kind: 'goal', round: 1 } }), false)
   assert.equal(pure.isUserAuthored({}), false)
   assert.equal(pure.isUserAuthored(null), false)
+})
+
+// ----------------------------------------------------------- boundNoticeSummary
+
+test('boundNoticeSummary mirrors DSH boundContextSummary (120-char bound)', () => {
+  assert.equal(pure.boundNoticeSummary('short'), 'short')
+  assert.equal(pure.boundNoticeSummary(''), '')
+  const exact = 'x'.repeat(120)
+  assert.equal(pure.boundNoticeSummary(exact), exact, 'exactly 120 stays unchanged')
+  const long = 'y'.repeat(300)
+  const bounded = pure.boundNoticeSummary(long)
+  assert.equal(bounded.length, 120, 'over-bound text is ellipsized to 120')
+  assert.ok(bounded.endsWith('…'))
+  assert.ok(bounded.startsWith('y'.repeat(119)))
+  // Non-string input degrades safely instead of throwing.
+  assert.equal(pure.boundNoticeSummary(null), 'null')
+  assert.equal(pure.boundNoticeSummary(42), '42')
 })
 
 // ---------------------------------------------------------------- capStopText

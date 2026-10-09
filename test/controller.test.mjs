@@ -275,6 +275,61 @@ test('fire steers 「繼續」 first, then restores the queued tasks in order', 
   assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 0, 'nothing stays hidden in memory')
 })
 
+// ------------------------------------------------------- session format v4
+//
+// DSH 0.2+ writes session logs in format v4, whose codec REFUSES the retired
+// v3 source wrapper `{ kind: 'plugin', plugin }` ("format v4 message requires a
+// producer-owned source kind") on both encode and decode — one such message
+// would make the whole session log fail to persist. Everything this plugin
+// injects must therefore name its producer the v4 way: `plugin:<package>`.
+
+test('the steered 「繼續」 is a session-format-v4 message', async (t) => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  t.after(() => ctx.dispose())
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.retryNow('s1')
+
+  assert.equal(agent.steered.length, 1)
+  const m = agent.steered[0]
+  assert.equal(m.role, 'user')
+  assert.ok(m.id && typeof m.id === 'string', 'message carries a stable id')
+  assert.deepEqual(m.content, [{ type: 'text', text: '繼續' }])
+  // Producer-owned v4 source: names itself as `plugin:<package>`…
+  assert.deepEqual(m.source, { kind: pure.PLUGIN_SOURCE_KIND })
+  assert.equal(m.source.kind, 'plugin:dsh-plugin-fallback-continue')
+  // …and does NOT carry the retired v3 `plugin` wrapper field.
+  assert.equal('plugin' in m.source, false)
+})
+
+test('the 429-cooldown notice is a format-v4 notice with a bounded summary', async (t) => {
+  const ctx = makeCtrl()
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  // Entering cooldown arms a real (multi-hour) setTimeout. Dispose through the
+  // test context so the timer is cleared EVEN IF an assertion below throws —
+  // a bare trailing cancel() would be skipped on failure and hang the runner.
+  t.after(() => ctx.dispose())
+
+  ctx.emit('agent/error', { agent, turn: 1, error: { status: 429 } })
+
+  assert.equal(agent.appended.length, 1, 'entering cooldown writes one notice')
+  const { type, msg } = agent.appended[0]
+  assert.equal(type, 'user/message')
+  assert.equal(msg.role, 'user')
+  assert.deepEqual(msg.source.kind, pure.PLUGIN_SOURCE_KIND)
+  assert.deepEqual(msg.source.form, 'notice')
+  assert.equal('plugin' in msg.source, false, 'no retired v3 wrapper field')
+  // `notice` commits a one-line account bounded at 120 chars (DSH's
+  // boundContextSummary contract) while the content keeps the full text.
+  assert.ok(msg.source.summary.length <= 120, 'summary is bounded')
+  assert.notEqual(msg.source.summary, msg.content[0].text, 'full text stays in the content')
+  assert.ok(msg.content[0].text.length > 120, 'content is the unbounded notice text')
+  assert.ok(msg.content[0].text.startsWith(msg.source.summary.slice(0, 10)))
+})
+
 test('「繼續」 is claimed first and alone, then the restored tasks resume in order', async () => {
   const ctx = makeCtrl()
   const agent = makeAgent('s1', ctx)
