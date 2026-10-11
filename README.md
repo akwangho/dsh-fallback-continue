@@ -60,7 +60,7 @@ dsh plugin --profile web add github:akwangho/dsh-fallback-continue
       name: 'dsh-plugin-fallback-continue'
 ```
 
-最後重啟 `dsh web` 生效。（若只是本機目錄測試，也可直接複製 `lib/` 與 `package.json` 到 `node_modules/dsh-plugin-fallback-continue/`。）
+最後重啟 `dsh web` 生效。（若只是本機目錄測試，也可直接複製 `lib/`、`locale/` 與 `package.json` 到 `node_modules/dsh-plugin-fallback-continue/`——少了 `locale/` 的話，「設定 → 外掛」清單會抓不到名稱與說明。）
 
 ## 設定如何儲存（volatile Config）
 

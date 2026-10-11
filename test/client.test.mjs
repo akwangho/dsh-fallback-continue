@@ -29,11 +29,43 @@ function makeReact() {
   }
 }
 
+// A React stub whose useState/useRef actually persist per component, so a
+// functional component can be rendered repeatedly against evolving module
+// state — enough to drive the settings page's draft-merge logic.
+function makeStatefulReact() {
+  const store = new Map()
+  let index = 0
+  const slot = () => {
+    index += 1
+    return index
+  }
+  return {
+    createElement(type, props, ...children) {
+      return { type, props: props || {}, children }
+    },
+    beginRender() { index = 0 },
+    useState(init) {
+      const i = slot()
+      if (!store.has(i)) store.set(i, { value: typeof init === 'function' ? init() : init })
+      const cell = store.get(i)
+      return [cell.value, (update) => { cell.value = typeof update === 'function' ? update(cell.value) : update }]
+    },
+    useRef(init) {
+      const i = slot()
+      if (!store.has(i)) store.set(i, { current: init })
+      return store.get(i)
+    },
+    useEffect(effect) { effect(); return undefined },
+    useMemo(factory) { return factory() },
+    useLayoutEffect() {},
+  }
+}
+
 // Load the real bundle and capture its factory definition.
-function loadBundle() {
+function loadBundle(react) {
   let definition = null
   const window = { __ModuleLoader__: { load(def) { definition = def } } }
-  const React = makeReact()
+  const React = react || makeReact()
   const require = (name) => {
     if (name === 'react') return React
     throw new Error('unexpected require: ' + name)
@@ -87,7 +119,10 @@ test('the floating pill renders for the main-view session in DSH 0.2', async (t)
 
   const { exports, React } = loadBundle()
   assert.equal(typeof exports.apply, 'function')
-  assert.deepEqual(exports.inject, ['slots', 'connection', 'remote', 'configForms'])
+  // 'remote' is deliberately NOT injected: every host call rides the raw
+  // connection.rpc string endpoint, and an unused hard service dependency
+  // would fail the mount on a build that does not provide it.
+  assert.deepEqual(exports.inject, ['slots', 'connection', 'configForms'])
 
   const { ctx, registered } = makeCtx({
     getState: () => ({
@@ -148,4 +183,115 @@ test('the current-session selector prefers the legacy `current` field when prese
   const tree = pill.component({ useSessions })
   assert.ok(tree, 'legacy current still resolves the session')
   assert.match(JSON.stringify(tree.children), /已送出/)
+})
+
+// ------------------------------------------------------- settings draft merge
+//
+// The draft is controlled by the Host form, but a text field keeps a local
+// copy until Save. Regression: every snapshot change used to reset the WHOLE
+// draft, so saving one field (or any host-side commit) silently wiped what
+// the user was typing in another field.
+
+test('a snapshot change adopts clean fields but never wipes a field being edited', async (t) => {
+  const realSetInterval = globalThis.setInterval
+  const realClearInterval = globalThis.clearInterval
+  globalThis.setInterval = () => 0
+  globalThis.clearInterval = () => {}
+  t.after(() => {
+    globalThis.setInterval = realSetInterval
+    globalThis.clearInterval = realClearInterval
+  })
+
+  const React = makeStatefulReact()
+  const { exports } = loadBundle(React)
+
+  const v1 = { enabled: true, continueText: '繼續', retryIntervalsMinutes: [5, 10], capEnabled: true, capHours: 24, cooldownMinutes: 720 }
+  let snapshot = { status: 'ready', value: { ...v1 }, writable: true }
+  let listener = null
+  const form = {
+    subscribe(l) { listener = l; return () => { listener = null } },
+    getSnapshot: () => snapshot,
+    set: async () => true,
+  }
+  const registered = []
+  const ctx = {
+    get(name) {
+      if (name === 'connection') {
+        return { rpc: { call: async () => ({ ok: true, value: { version: 'test', config: { ...v1 }, sessions: [] } }) } }
+      }
+      if (name === 'configForms') return { get: () => form }
+      if (name === 'slots') {
+        return { inject(slot, cb) { cb() }, register(o, c) { registered.push({ options: o, component: c }) } }
+      }
+      return undefined
+    },
+    effect(fn) { return fn() },
+    on() {},
+  }
+  exports.apply(ctx)
+  const page = registered.find((r) => r.options.id === 'fallback-continue')
+  assert.ok(page, 'the settings section must register')
+
+  const findInput = (tree, match) => {
+    const walk = (node) => {
+      if (node == null || typeof node !== 'object') return null
+      if (node.type === 'input' && match(node)) return node
+      for (const child of node.children || []) {
+        const hit = walk(child)
+        if (hit) return hit
+      }
+      return null
+    }
+    return walk(tree)
+  }
+
+  // First render wires the poll; the RPC resolves on the next tick.
+  React.beginRender()
+  page.component({})
+  await TICK()
+  await TICK()
+
+  React.beginRender()
+  let tree = page.component({})
+  const intervals = findInput(tree, (n) => n.props.value === '5,10')
+  assert.ok(intervals, 'the intervals input renders the Host value')
+
+  // The user types a new schedule (a local, unsaved edit)…
+  intervals.props.onChange({ target: { value: '9,9' } })
+
+  // …and the Host then commits a change to a DIFFERENT field (the toggle).
+  snapshot = { status: 'ready', value: { ...v1, enabled: false }, writable: true }
+  assert.ok(listener, 'the settings form subscription is wired')
+  listener()
+  // The stub runs effects during render; one pass applies the merge, the
+  // next renders the merged draft (real React defers this automatically).
+  React.beginRender()
+  page.component({})
+  React.beginRender()
+  tree = page.component({})
+
+  assert.ok(findInput(tree, (n) => n.props.value === '9,9'),
+    'the unsaved intervals edit survives the snapshot change')
+  const enabled = findInput(tree, (n) => n.props.type === 'checkbox')
+  assert.equal(enabled.props.checked, false, 'the clean enabled field adopts the Host value')
+
+  // Once the Host confirms the edited value, the field is clean again and
+  // later snapshots keep adopting the other fields.
+  snapshot = { status: 'ready', value: { ...v1, enabled: false, retryIntervalsMinutes: [9, 9] }, writable: true }
+  listener()
+  React.beginRender()
+  page.component({})
+  React.beginRender()
+  tree = page.component({})
+  assert.ok(findInput(tree, (n) => n.props.value === '9,9'), 'the confirmed value stays')
+
+  snapshot = { status: 'ready', value: { ...v1, enabled: true, retryIntervalsMinutes: [9, 9] }, writable: true }
+  listener()
+  React.beginRender()
+  page.component({})
+  React.beginRender()
+  tree = page.component({})
+  assert.ok(findInput(tree, (n) => n.props.value === '9,9'), 'the confirmed value still renders')
+  assert.equal(findInput(tree, (n) => n.props.type === 'checkbox').props.checked, true,
+    'a later snapshot still adopts clean fields')
 })
