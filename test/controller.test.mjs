@@ -818,3 +818,146 @@ test('a throwing config reference degrades to the default instead of crashing', 
   })
   assert.equal(ctrl.getState().config.enabled, pure.DEFAULTS.enabled)
 })
+
+// ---------------------------------------------------------------- archive
+//
+// Archiving is the user saying they no longer want that conversation, so it
+// cancels the countdown instead of letting it tick on for an hour on a session
+// nobody will read. dsh-workspace emits ONLY `domain/changed` for this (there is
+// no `session/archived`), and the registry is consulted through a lazy lookup
+// because this plugin does not inject it — so a registry that is only provided
+// after mount must still cancel the loop.
+
+// The real `domain/changed` payload for an archive: the whole new workspace
+// state, with no archive-specific diff for a consumer to read.
+const workspaceChange = (archivedSessionIds) => ({
+  domain: 'workspace',
+  table: '',
+  key: '',
+  operation: 'put',
+  value: { initialized: true, workspaceIds: [], archivedSessionIds, pinnedSessionIds: [] },
+})
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('archiving mid-countdown cancels it at once — the timer is really cleared', async (t) => {
+  // 0.02 min = 1.2s: long enough to show the countdown is gone, short enough
+  // that an uncleared timer WOULD have fired by the time we look.
+  const ctx = makeCtrl({ intervals: [0.02] })
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.emit('agent/inbox/inserted', { agent, message: makeNoSourceMsg('q') })
+  assert.equal(ctx.ctrl.getState().sessions[0].phase, 'counting')
+  assert.equal(ctx.ctrl.getState().sessions[0].heldCount, 1)
+
+  // The session is archived while the countdown runs.
+  ctx.getters.workspaceRegistry = { archivedSessionIds: ['s1'] }
+  ctx.emit('domain/changed', workspaceChange(['s1']))
+
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'the countdown is dropped, not just hidden')
+  assert.equal(agent.followed.length, 0, 'an archived session keeps its queue cancelled')
+
+  // The decisive assertion: the armed setTimeout is gone. Dropping the entry
+  // without clearing the timer would keep 「繼續」 on its way to a dead session.
+  await sleep(1400)
+  assert.equal(agent.steered.length, 0, 'no 「繼續」 is sent after the archive')
+})
+
+test('archiving cancels even when workspaceRegistry arrives AFTER the plugin mounted', async (t) => {
+  // The load-order regression: this plugin does not inject workspaceRegistry, so
+  // it may mount before dsh-workspace provides it. Reading the service once at
+  // construction is what used to disable archive detection for the whole
+  // process lifetime — the countdown then ran to completion regardless.
+  const ctx = makeCtrl()
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  assert.equal(ctx.getters.workspaceRegistry, undefined, 'no registry yet at mount time')
+
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'countdown is running')
+
+  ctx.getters.workspaceRegistry = { archivedSessionIds: ['s1'] }
+  ctx.emit('domain/changed', workspaceChange(['s1']))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'the late registry still cancels the countdown')
+
+  // A failure that arrives for an archived session must not start a new loop
+  // either — same lazy read, same answer.
+  ctx.emit('session/event', agent.session, turnEnd('s1', 2, 'error'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'an archived session never re-arms')
+  assert.equal(agent.steered.length, 0)
+})
+
+test('archiving cancels a paused countdown and an already-sent 「繼續」', async (t) => {
+  // Paused: the countdown is frozen but the streak is alive — archiving still
+  // ends it, or it would sit there indefinitely waiting for a resume nobody
+  // will give.
+  let ctx = makeCtrl({ getters: { workspaceRegistry: { archivedSessionIds: [] } } })
+  t.after(() => ctx.dispose())
+  let agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  ctx.ctrl.pause('s1')
+  assert.equal(ctx.ctrl.getState().sessions[0].paused, true)
+
+  ctx.getters.workspaceRegistry = { archivedSessionIds: ['s1'] }
+  ctx.emit('domain/changed', workspaceChange(['s1']))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'a paused countdown is cancelled too')
+
+  // Awaiting: 「繼續」 is already in the agent, so there is no countdown left —
+  // but the streak is still waiting on a result, and an archived session has no
+  // result worth waiting for.
+  ctx = makeCtrl({ getters: { workspaceRegistry: { archivedSessionIds: [] } } })
+  agent = makeAgent('s2', ctx)
+  ctx.agentMap.set('s2', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s2', 1, 'error'))
+  ctx.ctrl.retryNow('s2')
+  assert.equal(ctx.ctrl.getState().sessions[0].phase, 'awaiting')
+
+  ctx.getters.workspaceRegistry = { archivedSessionIds: ['s2'] }
+  ctx.emit('domain/changed', workspaceChange(['s2']))
+  assert.equal(ctx.ctrl.getState().sessions.length, 0, 'awaiting 「繼續」 stops on archive')
+  ctx.dispose()
+})
+
+test('a workspace change from ANOTHER session leaves the countdown alone', async (t) => {
+  const ctx = makeCtrl({ getters: { workspaceRegistry: { archivedSessionIds: ['s9'] } } })
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+
+  ctx.emit('domain/changed', workspaceChange(['s9']))
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'only the archived session is stopped')
+
+  // A payload with no `domain` (an older host) still gets the full sweep rather
+  // than silently skipping the archive.
+  ctx.emit('domain/changed', undefined)
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'a payload-less change sweeps harmlessly')
+
+  // And a change from a different domain is not even looked at.
+  ctx.emit('domain/changed', { domain: 'session', table: 'turns', key: 'k', operation: 'put', value: {} })
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'a foreign domain is ignored')
+  assert.doesNotThrow(() => ctx.emit('domain/changed', 'not-an-object'))
+})
+
+test('an unreadable registry reads as "not archived" instead of throwing', async (t) => {
+  // `requireState()` throws until dsh-workspace finished starting. A registry
+  // that blows up must never be mistaken for an archive, or a transient startup
+  // window would cancel live countdowns.
+  const boom = {
+    get archivedSessionIds() { throw new Error('workspace registry is not started yet') },
+  }
+  const ctx = makeCtrl({ getters: { workspaceRegistry: boom } })
+  t.after(() => ctx.dispose())
+  const agent = makeAgent('s1', ctx)
+  ctx.agentMap.set('s1', agent)
+  ctx.emit('session/event', agent.session, turnEnd('s1', 1, 'error'))
+  assert.equal(ctx.ctrl.getState().sessions.length, 1, 'the countdown survives an unreadable registry')
+
+  assert.doesNotThrow(() => ctx.emit('domain/changed', workspaceChange(['s1'])))
+  assert.equal(ctx.ctrl.getState().sessions.length, 1)
+})
